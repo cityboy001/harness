@@ -3,7 +3,16 @@ import { PublicError } from './models.mjs';
 const actionNames = ['inspect', 'click', 'fill', 'press', 'scroll', 'scroll_until', 'assert_text', 'assert_count'];
 const keys = new Set(['Enter', 'Tab', 'Escape', 'Space', 'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight']);
 export const browserTestLimit = 2;
-const maxActions = 10;
+export const maxActions = 20;
+
+export function previewTestActions(actions) {
+  return actions.map((step) => {
+    const selector = step.selector?.replace(/\[href\s*=\s*(["'])([^"']+)\1\]/giu, (attribute, quote, href) =>
+      /^(?:\.?\.?\/)?(?:[a-z\d_-]+\/)*[a-z\d_-]+\.html(?:[?#][^\r\n]*)?$/iu.test(href)
+        ? `:is(${attribute},[data-preview-href=${quote}${href}${quote}])` : attribute);
+    return selector !== step.selector ? { ...step, selector } : step;
+  });
+}
 
 export class BrowserValidationError extends PublicError {}
 
@@ -158,7 +167,7 @@ export function createBrowserTools(testBrowser, prior, buildDraft, signal) {
         return { status: 'invalid', error: error.message };
       }
       const result = await testBrowser(files, actions, signal);
-      tests.push({ files, result });
+      tests.push({ files, result, actions });
       if (candidate && result.status === 'passed' &&
           actions.some(({ action }) => action === 'assert_text' || action === 'assert_count')) {
         verifiedFiles = files;
@@ -173,12 +182,15 @@ export function createBrowserTools(testBrowser, prior, buildDraft, signal) {
     async finish(candidate, draft) {
       const files = candidate === undefined ? draft.files : candidates.get(candidate);
       if (!files) throw new PublicError(422, '模型选中的浏览器测试版本不存在，请重试。');
-      let result = tests.findLast((entry) => sameFiles(entry.files, files))?.result;
-      if (!result) result = await testBrowser(files, [{ action: 'inspect' }], signal);
+      const previous = tests.findLast((entry) => sameFiles(entry.files, files));
+      const actions = previous?.actions ?? [{ action: 'inspect' }];
+      const result = previous?.result ?? await testBrowser(files, actions, signal);
       if (result.status === 'failed') {
         const detail = result.steps?.find((step) => !step.ok)?.error || result.error || result.errors?.[0];
-        throw new BrowserValidationError(422, (prior ? '浏览器验证失败，已保留上一版。' : '浏览器验证失败，请调整需求后重试。') +
+        const error = new BrowserValidationError(422, (prior ? '浏览器验证失败，已保留上一版。' : '浏览器验证失败，请调整需求后重试。') +
           (detail ? '\n' + detail : ''));
+        error.verification = { result, actions };
+        throw error;
       }
       return { files, summary: annotate(draft.summary, result) };
     }

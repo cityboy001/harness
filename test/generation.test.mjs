@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { test } from 'node:test';
-import { buildWebsite } from '../server/generation.mjs';
+import { buildWebsite, mergeWorkerChanges, validateProjectFiles } from '../server/generation.mjs';
 import { ModelOutputLimitError, readCompletionStream } from '../server/models.mjs';
 
 const project = {
@@ -14,6 +14,21 @@ const patch = {
   summary: '更新标题并删除旧脚本。',
   changes: { 'index.html': '<h1>New title</h1>', 'obsolete.js': null, 'new.css': '.heading {color: red}' }
 };
+
+test('static files support the reported page size and each worker retains a separate patch budget', async () => {
+  const page = '<h1>外卖</h1><!--';
+  const html = page + 'x'.repeat(24735 - Buffer.byteLength(page) - 3) + '-->';
+  const result = await buildWebsite({ platform: true }, 'Build a menu.', undefined, async () =>
+    JSON.stringify({ files: { 'index.html': html, 'server.js': project['server.js'] } }), { maxTokens: 32000 });
+  assert.equal(Buffer.byteLength(result.files['index.html']), 24735);
+
+  const merged = mergeWorkerChanges(result.files, [
+    { 'menu.js': ' '.repeat(35000) }, { 'admin.js': ' '.repeat(35000) }
+  ]);
+  validateProjectFiles(merged.files);
+  assert.equal(merged.files['menu.js'].length + merged.files['admin.js'].length, 70000);
+  assert.throws(() => mergeWorkerChanges(result.files, [{ 'server.js': ' '.repeat(24001) }]), /server\.js.*24001.*24000/);
+});
 
 test('a worker can correct an ambiguous edit without starting another repair round', async () => {
   const original = { ...project, 'nav.js': 'const first = 0;\nconst second = 0;' };

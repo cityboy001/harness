@@ -51,6 +51,11 @@ export function openStore(root, encryptionKey) {
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       version INTEGER NOT NULL, files TEXT NOT NULL, UNIQUE(project_id, version)
     );
+    CREATE TABLE IF NOT EXISTS project_chats (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      title TEXT, created INTEGER NOT NULL, through_rowid INTEGER, summary TEXT
+    );
+    CREATE INDEX IF NOT EXISTS project_chat_list ON project_chats(project_id, created);
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       prompt TEXT NOT NULL, model_id TEXT NOT NULL, model_name TEXT NOT NULL, state TEXT NOT NULL,
@@ -59,6 +64,15 @@ export function openStore(root, encryptionKey) {
     CREATE TABLE IF NOT EXISTS message_reasoning (
       message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
       body TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS generation_runs (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      base_revision TEXT, draft_id TEXT, draft_files TEXT
+    );
+    CREATE TABLE IF NOT EXISTS generation_checkpoints (
+      message_id TEXT NOT NULL REFERENCES generation_runs(message_id) ON DELETE CASCADE,
+      namespace TEXT NOT NULL, checkpoint_id TEXT NOT NULL, snapshot BLOB, writes BLOB,
+      PRIMARY KEY(message_id, namespace, checkpoint_id)
     );
     CREATE TABLE IF NOT EXISTS project_memory (
       project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
@@ -88,8 +102,11 @@ export function openStore(root, encryptionKey) {
   }
   if (!messageColumns.has('agent_progress')) db.exec('ALTER TABLE messages ADD COLUMN agent_progress TEXT');
   if (!messageColumns.has('agent_events')) db.exec('ALTER TABLE messages ADD COLUMN agent_events TEXT');
-  db.prepare("UPDATE messages SET state = 'failed', response = ? WHERE state = 'running'")
-    .run('平台重启中断了生成，请重试。');
+  if (!messageColumns.has('chat_id')) db.exec('ALTER TABLE messages ADD COLUMN chat_id TEXT REFERENCES project_chats(id) ON DELETE CASCADE');
+  db.exec('CREATE INDEX IF NOT EXISTS chat_message_history ON messages(project_id, chat_id, created)');
+  db.prepare(`UPDATE messages SET state = 'failed', agent_progress = NULL, response = CASE WHEN EXISTS (
+    SELECT 1 FROM generation_checkpoints WHERE message_id = messages.id AND snapshot IS NOT NULL
+  ) THEN ? ELSE ? END WHERE state = 'running'`).run('平台重启中断了生成，请从检查点继续。', '平台重启中断了生成，请重试。');
   const get = (sql, ...params) => db.prepare(sql).get(...params);
   const all = (sql, ...params) => db.prepare(sql).all(...params);
   const run = (sql, ...params) => db.prepare(sql).run(...params);

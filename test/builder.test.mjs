@@ -11,7 +11,140 @@ import { isPublicAddress, parseEndpoint } from '../server/models.mjs';
 
 const origin = 'http://localhost:3000';
 
-test('retrying the herb management request preserves its previous team route', async (t) => {
+test('a failed browser check preserves a private candidate and resumes the same run after reopening SQLite', async (t) => {
+  const data = await mkdtemp(join(tmpdir(), 'site-builder-resume-'));
+  let app;
+  let planning = 0;
+  let writes = 0;
+  let checks = 0;
+  const actions = [{ action: 'click', selector: '#save' }, { action: 'assert_text', value: '测试候选' }];
+  const config = {
+    data, origin, deepseekKey: 'fixture', dailyUser: 1,
+    async completion(_model, messages) {
+      if (messages[0].content.startsWith('You are the central planning agent')) {
+        planning++;
+        return JSON.stringify({ mode: 'team', frontend: 'Build the page.', backend: 'Provide a handler.', contract: 'Use #save.', tests: actions });
+      }
+      writes++;
+      return messages[0].content.includes('frontend sub-agent')
+        ? '{"changes":{"index.html":"<button id=\\"save\\">测试候选</button>"}}'
+        : '{"changes":{"server.js":"function handle() { return {status: 200, body: {ok: true}}; }"}}';
+    },
+    testBrowser(files, steps) {
+      assert.match(files['index.html'], /测试候选/);
+      assert.deepEqual(JSON.parse(JSON.stringify(steps)), actions);
+      return { status: ++checks === 1 ? 'unavailable' : 'passed' };
+    }
+  };
+  t.after(async () => {
+    await app?.close();
+    await rm(data, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  app = await createApp(config);
+  let cookie;
+  const request = (method, path, payload) => app.inject({ method, url: '/api/' + path, payload,
+    headers: { origin, ...(cookie && { cookie }) } });
+  const signup = await request('POST', 'register', { name: 'resume-owner', password: 'resume-password' });
+  cookie = signup.headers['set-cookie'].split(';')[0];
+  const project = 'projects/' + (await request('POST', 'projects', { name: '检查点' })).json().id;
+  const started = await request('POST', project + '/generate', { prompt: '生成测试网站' });
+  assert.equal(started.statusCode, 202);
+  const { id } = started.json();
+  async function waitFor(state) {
+    for (let attempt = 0; attempt < 140; attempt++) {
+      const snapshot = (await request('GET', project)).json();
+      if (snapshot.messages.find((message) => message.id === id)?.state === state) return snapshot;
+      await delay(20);
+    }
+    assert.fail('Missing generation state ' + state);
+  }
+  const failed = await waitFor('failed');
+  assert.equal(failed.messages[0].has_checkpoint, 1);
+  assert.equal(failed.project.revision, null);
+  assert.equal(failed.project.hasSavedDraft, true);
+  await app.close();
+  app = await createApp(config);
+
+  const draft = await request('POST', project + '/preview/start', { draft: true });
+  assert.equal(draft.statusCode, 200, draft.body);
+  assert.ok(draft.json().draftRevision);
+  assert.match((await request('GET', project + '/preview')).json().files['index.html'], /测试候选/);
+  const resumed = await request('POST', project + '/generate', { resumeMessageId: id });
+  assert.equal(resumed.statusCode, 202, resumed.body);
+  assert.equal(resumed.json().id, id);
+  const completed = await waitFor('complete');
+  assert.ok(completed.project.revision);
+  assert.equal(completed.project.hasSavedDraft, false);
+  assert.equal(completed.messages[0].has_checkpoint, 0);
+  assert.equal(completed.messages.length, 1);
+  assert.equal(planning, 1);
+  assert.equal(writes, 2);
+  assert.equal(checks, 2);
+});
+
+test('project chats isolate messages and planner context while sharing the current revision', async (t) => {
+  const data = await mkdtemp(join(tmpdir(), 'site-builder-chats-'));
+  const observed = [];
+  const app = await createApp({
+    data, origin, demo: true, deepseekKey: 'test',
+    async completion(_model, messages) {
+      if (messages[0].content.startsWith('You are the central planning agent')) {
+        observed.push(JSON.parse(messages[1].content));
+        return '{"mode":"direct"}';
+      }
+      return '{"answer":"收到。"}';
+    }
+  });
+  t.after(async () => {
+    await app.close();
+    await rm(data, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  let cookie;
+  const request = (method, path, payload) => app.inject({
+    method, url: '/api/' + path, payload, headers: { origin, ...(cookie && { cookie }) }
+  });
+  const signup = await request('POST', 'register', { name: 'chat-owner', password: 'chat-password' });
+  cookie = signup.headers['set-cookie'].split(';')[0];
+  const project = 'projects/' + (await request('POST', 'projects', { name: '会话' })).json().id;
+  const otherProject = 'projects/' + (await request('POST', 'projects', { name: '另一个项目' })).json().id;
+  async function generate(prompt, chatId = null, modelId = 'platform') {
+    const response = await request('POST', project + '/generate', { prompt, chatId, modelId });
+    assert.equal(response.statusCode, 202, response.body);
+    const messageId = response.json().id;
+    for (let i = 0; i < 100; i++) {
+      const snapshot = (await request('GET', project + (chatId ? '?chat=' + chatId : ''))).json();
+      const turn = snapshot.messages.find(({ id }) => id === messageId);
+      if (turn && turn.state !== 'running') {
+        assert.equal(turn.state, 'complete', turn.response);
+        return snapshot;
+      }
+      await delay(20);
+    }
+    assert.fail('Expected generation to finish');
+  }
+
+  const old = await generate('生成待办网站', null, 'demo');
+  assert.ok(old.project.revision);
+  const chat = (await request('POST', project + '/chats', {})).json();
+  const empty = (await request('GET', project + '?chat=' + chat.id)).json();
+  assert.equal(empty.project.revision, old.project.revision);
+  assert.deepEqual(empty.messages, []);
+  assert.deepEqual(empty.chats, [chat]);
+  assert.equal((await request('GET', otherProject + '?chat=' + chat.id)).statusCode, 404);
+  assert.equal((await request('POST', otherProject + '/generate', { prompt: '越权', chatId: chat.id })).statusCode, 404);
+
+  const first = await generate('第一条独立消息', chat.id);
+  assert.deepEqual(first.chats, [{ id: chat.id, title: '第一条独立消息' }]);
+  assert.deepEqual(observed[0].projectMemory.recent, []);
+  const second = await generate('第二条独立消息', chat.id);
+  assert.deepEqual(second.messages.map(({ prompt }) => prompt), ['第一条独立消息', '第二条独立消息']);
+  assert.deepEqual(observed[1].projectMemory.recent.map(({ request }) => request), ['第一条独立消息']);
+  const original = (await request('GET', project)).json();
+  assert.deepEqual(original.messages.map(({ prompt }) => prompt), ['生成待办网站']);
+  assert.equal(original.project.revision, second.project.revision);
+});
+
+test('retrying a failed team request gives the planner failure evidence and a fresh route choice', async (t) => {
   const data = await mkdtemp(join(tmpdir(), 'site-builder-team-retry-'));
   const prompt = '我要做一个后台药材商 进货 出货 药材管理 药方计价零售 订单管理 还有汇总界面的一个后台管理系统，请你先好好规划要做的功能 然后开始干活';
   const tests = [{ action: 'click', selector: '#save' }, { action: 'assert_text', value: '测试药材' }];
@@ -24,15 +157,18 @@ test('retrying the herb management request preserves its previous team route', a
       if (instructions.startsWith('You are the central planning agent')) {
         const context = JSON.parse(messages[1].content);
         assert.equal(context.request, prompt);
-        assert.equal(context.teamRequired, ++plans > 1);
-        if (plans === 2) return '{"mode":"direct"}';
-        if (plans === 3) {
-          assert.deepEqual(context.rejectedPlan, { mode: 'direct' });
-          assert.match(context.validationError, /Keep its full scope and return a team plan/);
+        assert.equal(context.teamRequired, false);
+        if (++plans === 2) {
+          assert.deepEqual(context.previousAttempt, { state: 'failed', response: '浏览器测试暂不可用，请稍后重试。' });
+          return '{"mode":"direct"}';
         }
         return JSON.stringify({ mode: 'team', frontend: 'Inventory, purchases, shipments, pricing, orders and dashboard.',
           backend: 'Provide the required server entry.', contract: 'Use #save to add a record.', tests });
       }
+      if (plans === 2) return JSON.stringify({ files: {
+        'index.html': '<button id="save">保存测试药材</button>',
+        'server.js': 'function handle(){return {status:404,body:null}}'
+      } });
       if (instructions.includes('frontend sub-agent')) {
         return '{"changes":{"index.html":"<button id=\\"save\\">保存</button>"}}';
       }
@@ -41,7 +177,7 @@ test('retrying the herb management request preserves its previous team route', a
     },
     async testBrowser(candidate, actions) {
       assert.match(candidate['index.html'], /id="save"/);
-      assert.deepEqual(JSON.parse(JSON.stringify(actions)), tests);
+      assert.deepEqual(JSON.parse(JSON.stringify(actions)), browserRuns === 0 ? tests : [{ action: 'inspect' }]);
       return { status: ++browserRuns === 1 ? 'unavailable' : 'passed' };
     }
   });
@@ -76,22 +212,11 @@ test('retrying the herb management request preserves its previous team route', a
   assert.equal(first.project.revision, null);
   assert.ok(first.message.agent_events.some(({ kind, role }) => kind === 'assign' && role === 'frontend'));
 
-  // A newer direct failure from the old router must not hide the earlier team attempt.
-  const db = new DatabaseSync(join(data, 'platform.sqlite'));
-  try {
-    db.prepare(`INSERT INTO messages (id, project_id, prompt, model_id, model_name, state, response, agent_events, created)
-      VALUES (?, ?, ?, 'platform', 'DeepSeek', 'failed', 'Invalid JSON', ?, ?)`).run(
-      'old-direct', projectId, prompt, JSON.stringify([{ kind: 'status', role: 'direct', state: 'running' }]), Date.now());
-  } finally {
-    db.close();
-  }
   const retried = await finished(await start());
   assert.equal(retried.message.state, 'complete');
   assert.ok(retried.project.revision);
-  assert.ok(retried.message.agent_events.some(({ kind, role, state }) => kind === 'check' && role === 'browser' && state === 'done'));
-  assert.ok(retried.message.agent_events.some(({ kind, role }) => kind === 'assign' && role === 'backend'));
-  assert.equal(retried.message.agent_events.some(({ role }) => role === 'direct'), false);
-  assert.equal(plans, 3);
+  assert.ok(retried.message.agent_events.some(({ role, state }) => role === 'direct' && state === 'done'));
+  assert.equal(plans, 2);
   assert.equal(browserRuns, 2);
 });
 

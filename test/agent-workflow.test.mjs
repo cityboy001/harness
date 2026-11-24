@@ -106,7 +106,7 @@ test('LangGraph runs both roles concurrently and sends a browser failure back to
   assert.equal(browserRuns, 2);
   assert.deepEqual([...started].sort(), ['backend', 'frontend']);
   assert.equal(writes.filter((role) => role === 'frontend').length, 1);
-  assert.ok(checkpoints.some((text) => text.includes('派回后端')));
+  assert.ok(checkpoints.some((text) => text.includes('重新规划的修复任务')));
   assert.ok(events.some((event) => event.kind === 'assign' && event.role === 'frontend' && event.round === 0));
   const failure = events.findIndex((event) => event.kind === 'check' && event.step === 3 && event.expected === 'sample');
   const repair = events.findIndex((event) => event.kind === 'assign' && event.role === 'backend' && event.round === 1);
@@ -248,7 +248,7 @@ test('a new infinite-scroll gallery reaches direct browser verification after a 
     const output = await buildProject(model, '做一个图片瀑布流效果 能无限滚动的', undefined, async (_config, messages) => {
       if (isPlan(messages[0])) {
         if (++plans === 1) return JSON.stringify(galleryPlan);
-        assert.match(JSON.parse(messages[1].content).validationError, /needs both frontend and backend/);
+        assert.match(JSON.parse(messages[1].content).validationError, /index.html and server.js/);
         return JSON.stringify(revised);
       }
       assert.doesNotMatch(messages[0].content, /sub-agent/);
@@ -317,7 +317,7 @@ test('website tasks can read their own project evidence before editing and runni
 });
 
 for (const repeatError of [false, true]) {
-test(repeatError ? 'identical browser failures stop after three checks' : 'changing browser failures still stop after two repair rounds', async () => {
+test(repeatError ? 'identical browser failures honor the 20-round cap' : 'changing browser failures honor the 20-round cap', async () => {
   let browserRuns = 0;
   let repairs = 0;
   const changes = { ...files };
@@ -337,9 +337,9 @@ test(repeatError ? 'identical browser failures stop after three checks' : 'chang
   }, {
     maxTokens: 32000,
     async testBrowser() { browserRuns++; return { status: 'failed', error: 'Assertion failed ' + (repeatError ? 1 : browserRuns) }; }
-  }), repeatError ? /连续 3 次遇到同一错误.*\nAssertion failed/ : /修复 2 轮后仍未通过验收.*\nAssertion failed 3/);
-  assert.equal(browserRuns, 3);
-  assert.equal(repairs, 2);
+  }), repeatError ? /修复 20 轮后仍未通过验收.*\nAssertion failed 1/ : /修复 20 轮后仍未通过验收.*\nAssertion failed 21/);
+  assert.equal(browserRuns, 21);
+  assert.equal(repairs, 20);
 });
 }
 

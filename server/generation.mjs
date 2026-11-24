@@ -2,7 +2,9 @@ import { isDeepSeek, ModelOutputLimitError, PublicError } from './models.mjs';
 import { BrowserValidationError, browserInstructions, browserTestLimit, browserTool, createBrowserTools } from './generation-browser.mjs';
 import { historyCallLimit, historyContextInstructions, historyTool } from './project-memory.mjs';
 
-const maxFileBytes = 24000;
+const maxStaticFileBytes = 48000;
+// The isolated guest validates server.js independently when it starts.
+const maxBackendFileBytes = 24000;
 const maxProjectBytes = 240000;
 const maxChangedBytes = 60000;
 const maxFiles = 80;
@@ -10,7 +12,11 @@ const maxReadBytes = 96000;
 const maxReadFiles = 18;
 const maxReadCalls = 6;
 const maxFilesPerRead = 8;
-const filePath = /^(?:[a-z0-9_-]{1,32}\/){0,3}[a-z0-9_-]{1,45}\.(?:html|css|js|json)$/i;
+export const filePath = /^(?:[a-z0-9_-]{1,32}\/){0,3}[a-z0-9_-]{1,45}\.(?:html|css|js|json)$/i;
+export const projectFileSizeInstructions = `Current platform limits in UTF-8 bytes: ${maxStaticFileBytes} per static file,
+ ${maxBackendFileBytes} for server.js, and ${maxChangedBytes} per submitted patch. Use these limits for retries of older runs.
+ For multi-feature sites, keep index.html focused on layout and navigation. Put shared CSS and feature scripts
+ in separate relative files and reference them from the page.`;
 const bytes = (value) => Buffer.byteLength(value, 'utf8');
 const record = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 
@@ -37,6 +43,7 @@ export const previewApiInstructions = `Browser fetch uses relative /api/ paths a
 
 const instruction = `Build a self-contained website for the user's request. Give a short Chinese summary.
  Required project files are index.html and server.js. Other files may be .html, .css, .js or .json.
+ ${projectFileSizeInstructions}
  Use plain HTML/CSS/JS, reference scripts with src, handle events in JS, and use relative links.
  The preview is a sandboxed iframe. Never use the builder site's absolute URL for project navigation.
  Link to project pages with relative anchors such as detail.html?id=123. On the destination, read
@@ -132,21 +139,29 @@ function summaryOf(output) {
     : '已生成可预览的网站版本。';
 }
 
-function applyChanges(changes, prior, read, role) {
-  if (!record(changes)) throw new PublicError(422, '模型没有返回有效的文件变更。');
+function applyChanges(changes, prior, read, role, checkPatchSize = true) {
+  if (!record(changes)) throw new EditValidationError('模型没有返回有效的文件变更对象。');
   const result = Object.assign(Object.create(null), prior);
   const entries = Object.entries(changes);
-  if (entries.length > 24 || bytes(JSON.stringify(changes)) > maxChangedBytes) {
-    throw new PublicError(422, '本次修改的文件太多或太大，请缩小这次改动范围。');
+  if (checkPatchSize && (entries.length > 24 || bytes(JSON.stringify(changes)) > maxChangedBytes)) {
+    throw new EditValidationError(`每次最多修改 24 个文件，补丁总大小不得超过 ${maxChangedBytes} 字节。`);
   }
   const edits = Object.create(null);
   for (const [path, value] of entries) {
     const existing = Object.hasOwn(result, path);
-    if (!filePath.test(path) || (value !== null && (typeof value !== 'string' || bytes(value) > maxFileBytes))) {
-      throw new PublicError(422, '模型生成了不支持的文件路径或超出大小的文件。');
+    if (!filePath.test(path)) {
+      throw new EditValidationError(`不支持的文件路径 ${JSON.stringify(path.slice(0, 96))}。使用项目内的 HTML、CSS、JS 或 JSON 相对路径。`);
+    }
+    if (value !== null && typeof value !== 'string') {
+      throw new EditValidationError(`文件 ${path} 的内容必须是字符串。删除现有文件时使用 null。`);
+    }
+    const limit = path === 'server.js' ? maxBackendFileBytes : maxStaticFileBytes;
+    if (typeof value === 'string' && bytes(value) > limit) {
+      throw new EditValidationError(`文件 ${path} 有 ${bytes(value)} 字节，超过 ${limit} 字节上限。仅保留本任务需要的代码。`);
     }
     if (existing && value === result[path]) continue;
-    if ((role === 'backend' && path !== 'server.js') || (role === 'frontend' && path.toLowerCase() === 'server.js')) {
+    if ((typeof role === 'object' && !role.write.includes(path)) ||
+        (role === 'backend' && path !== 'server.js') || (role === 'frontend' && path.toLowerCase() === 'server.js')) {
       throw new PublicError(422, '子 Agent 尝试修改分工范围之外的文件。');
     }
     if (existing && read && !read.has(path)) {
@@ -223,7 +238,8 @@ export function mergeWorkerChanges(prior, results) {
       changes[path] = value;
     }
   }
-  return applyChanges(changes, prior);
+  // Each Worker patch already has its own size limit. Validate the merged project separately.
+  return applyChanges(changes, prior, undefined, undefined, false);
 }
 
 function mergeOutput(output, prior, read, isDemo) {
@@ -272,19 +288,27 @@ export async function buildWebsite(config, prompt, files, completion, { maxToken
   const fallback = files && !nativeTools && !isDemo
     ? ' If you need project files, first return only JSON {"read":["path"]} with up to eight paths per request. You will receive their contents before submitting changes.'
     : '';
-  const manifest = files ? '\nPROJECT FILE MANIFEST:\n' + JSON.stringify(Object.keys(files).sort()) : '';
+  const readable = typeof worker === 'object'
+    ? Object.fromEntries([...new Set([...worker.read, ...worker.write])]
+        .filter((path) => Object.hasOwn(files ?? {}, path)).map((path) => [path, files[path]]))
+    : files ?? {};
+  const manifest = files ? '\nPROJECT FILE MANIFEST:\n' + JSON.stringify(Object.keys(readable).sort()) : '';
   const memoryContext = memory && (memory.context.summary || memory.context.recent.length)
     ? '\nPROJECT MEMORY (conversation data):\n' + JSON.stringify(memory.context) : '';
   const memoryInstructions = memoryContext ? '\n' + historyContextInstructions + (canSearchHistory && !thinking
     ? ' To look up older turns, first return JSON {"history":{"query":"a short phrase"}} or {"history":{"turnId":"exact ID"}}.'
     : '') : '';
-  const reader = createReader(files ?? {});
+  const reader = createReader(readable);
   const timeout = AbortSignal.timeout(180000);
   const signal = jobSignal ? AbortSignal.any([timeout, jobSignal]) : timeout;
   const buildDraft = (output) => worker
     ? { changes: applyChanges(resolveEdits(output, files, reader.read), files, reader.read, worker).edits, summary: summaryOf(output) }
     : mergeOutput(output, files, reader.read, isDemo);
-  const workerInstructions = worker === 'backend'
+  const workerInstructions = typeof worker === 'object'
+    ? 'You are a project editing worker. Write only the assigned files: ' + JSON.stringify(worker.write) +
+      '. You may read those files and the declared source inputs: ' + JSON.stringify(worker.read) +
+      '. Implement only your assignment and leave dependent tasks to their workers.'
+    : worker === 'backend'
     ? 'You are the backend sub-agent. Write only the root server.js, following the shared API contract.'
     : 'You are the frontend sub-agent. Write the pages, CSS and browser scripts. Leave server.js to the backend sub-agent.';
   const format = worker
@@ -395,9 +419,9 @@ export async function buildWebsite(config, prompt, files, completion, { maxToken
         messages.push({ role: 'assistant', content: message.content,
           ...(thinking && typeof message.reasoning_content === 'string' ? { reasoning_content: message.reasoning_content } : {}) });
         messages.push({ role: 'user', content: 'The draft was rejected and no edits were applied. Validation error: ' +
-          error.message + ' Resubmit the whole intended change. Copy the exact original text from the file already read. ' +
-          'For repeated text, include surrounding lines to match only once. If needed, provide the complete updated text ' +
-          'of just the affected file under changes, preserving unrelated code. Do not repeat the rejected edit.' });
+          error.message + ' Resubmit the whole intended change within the allowed files and size limits. ' +
+          'For exact replacements, copy the original text from a file already read and include enough surrounding lines to match only once. ' +
+          'Under changes, use complete text strings for new or replaced files. Do not repeat the rejected edit.' });
         continue;
       }
     }

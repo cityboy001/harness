@@ -5,7 +5,7 @@ import {
   Copy, Globe2, Link2, LoaderCircle, LockKeyhole, LogOut, Monitor, Pencil, Play, Plus, RotateCw, Send, Settings2,
   Sparkles, Square, Trash2, X
 } from 'lucide-vue-next';
-import { api, message, type Conversation, type Model, type Project, type Revision, type SharedRevision, type ShareLink, type User } from './api';
+import { ApiError, api, message, type Conversation, type Model, type Project, type ProjectChat, type ProjectWorkspace, type Revision, type SharedRevision, type ShareLink, type User } from './api';
 import PreviewFrame from './PreviewFrame.vue';
 import AgentProgress from './AgentProgress.vue';
 
@@ -16,6 +16,12 @@ const username = ref('');
 const password = ref('');
 const projects = ref<Project[]>([]);
 const current = ref<Project | null>(null);
+const chats = ref<ProjectChat[]>([]);
+const selectedChat = ref('');
+const creatingChat = ref(false);
+const loadingChat = ref(false);
+const activeGeneration = ref<ProjectWorkspace['activeGeneration']>(null);
+const chatDrafts = new Map<string, string>();
 const history = ref<Conversation[]>([]);
 const reasoning = ref<Record<string, string>>({});
 const reasoningErrors = ref<Record<string, string>>({});
@@ -33,6 +39,7 @@ const preview = ref<Revision | null>(null);
 const previewReload = ref(0);
 const previewError = ref('');
 const workspaceError = ref('');
+const pollError = ref('');
 const pageError = ref('');
 const busy = ref(false);
 const starting = ref(false);
@@ -54,12 +61,12 @@ const sharedError = ref('');
 const shareLink = ref<ShareLink | null>(null);
 const shareFeedback = ref('');
 let poll: ReturnType<typeof setInterval> | undefined;
-let polling = false;
+let polling: symbol | undefined;
 let viewToken = 0;
 let renderToken = 0;
 
-const activeGeneration = computed(() => history.value.find((entry) => entry.state === 'running'));
 const running = computed(() => Boolean(activeGeneration.value));
+const runningInAnotherChat = computed(() => activeGeneration.value !== null && (activeGeneration.value.chat_id ?? '') !== selectedChat.value);
 const customModels = computed(() => models.value.filter((model) => model.source === 'custom'));
 const activeModel = computed(() => models.value.find((model) => model.id === selectedModel.value) ?? platform.value);
 const fileNames = computed(() => Object.keys(source.value?.files ?? {}).sort());
@@ -69,7 +76,8 @@ function formatDate(value: number) {
   return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(value);
 }
 function stateLabel(item: Project) {
-  if (item.draftRevision) return '验收中';
+  if (item.draftRevision) return '候选预览';
+  if (item.hasSavedDraft && !item.revision) return '候选已保存';
   if (item.preview === 'running') return '运行中';
   if (item.preview === 'starting') return '启动中';
   return item.revision ? '预览已停止' : '草稿';
@@ -82,16 +90,24 @@ function modelLabel(model: Model) {
 function scrollThread() {
   void nextTick(() => { if (thread.value) thread.value.scrollTop = thread.value.scrollHeight; });
 }
-function setUrl(id?: string, replace = false) {
+function setUrl(id?: string, replace = false, chat = '') {
   const url = new URL(location.href);
   if (id) url.searchParams.set('project', id);
   else url.searchParams.delete('project');
+  if (id && chat) url.searchParams.set('chat', chat);
+  else url.searchParams.delete('chat');
   if (url.href !== location.href) window.history[replace ? 'replaceState' : 'pushState'](null, '', url);
 }
 function resetWorkspace() {
   viewToken++;
   renderToken++;
   current.value = null;
+  selectedChat.value = '';
+  chats.value = [];
+  activeGeneration.value = null;
+  creatingChat.value = false;
+  loadingChat.value = false;
+  chatDrafts.clear();
   history.value = [];
   reasoning.value = {};
   reasoningErrors.value = {};
@@ -102,6 +118,7 @@ function resetWorkspace() {
   preview.value = null;
   previewError.value = '';
   workspaceError.value = '';
+  pollError.value = '';
   prompt.value = '';
   starting.value = false;
   sending.value = false;
@@ -240,24 +257,42 @@ async function signOut() {
 }
 async function restoreRoute() {
   if (!user.value) return;
-  const id = new URL(location.href).searchParams.get('project');
-  if (id) await openProject(id, false);
+  const route = new URL(location.href).searchParams;
+  const id = route.get('project');
+  const chat = route.get('chat') ?? '';
+  if (id && current.value?.id === id) {
+    if (chat && !chats.value.some((item) => item.id === chat)) setUrl(id, true, selectedChat.value);
+    else await selectChat(chat, false);
+  } else if (id) await openProject(id, false, chat);
   else {
     resetWorkspace();
     await loadProjects();
   }
 }
-async function openProject(id: string, updateUrl = true) {
+function workspaceData(id: string, chat: string) {
+  return api<ProjectWorkspace>('projects/' + id + (chat ? '?chat=' + encodeURIComponent(chat) : ''));
+}
+function updateWorkspace(result: ProjectWorkspace) {
+  current.value = result.project;
+  chats.value = result.chats;
+  activeGeneration.value = result.activeGeneration;
+  history.value = result.messages;
+}
+async function openProject(id: string, updateUrl = true, chat = '') {
   if (current.value?.id === id) return;
   resetWorkspace();
   pageError.value = '';
   const token = viewToken;
   try {
-    const result = await api<{ project: Project; messages: Conversation[] }>('projects/' + id);
+    const result = await workspaceData(id, chat).catch((error) => {
+      if (!chat || !(error instanceof ApiError) || error.status !== 404) throw error;
+      chat = '';
+      return workspaceData(id, chat);
+    });
     if (viewToken !== token || !user.value) return;
-    current.value = result.project;
-    history.value = result.messages;
-    if (updateUrl) setUrl(id);
+    selectedChat.value = chat;
+    updateWorkspace(result);
+    setUrl(id, !updateUrl, chat);
     if (result.project.preview === 'running' || result.project.draftRevision) await loadPreview();
     scrollThread();
   } catch (error) {
@@ -266,27 +301,59 @@ async function openProject(id: string, updateUrl = true) {
     setUrl(undefined, true);
   }
 }
+async function selectChat(chat: string, updateUrl = true) {
+  const id = current.value?.id;
+  if (!id || selectedChat.value === chat) return;
+  chatDrafts.set(selectedChat.value, prompt.value);
+  selectedChat.value = chat;
+  prompt.value = chatDrafts.get(chat) ?? '';
+  history.value = [];
+  expandedReasoning.clear();
+  workspaceError.value = '';
+  loadingChat.value = true;
+  if (updateUrl) setUrl(id, false, chat);
+  await refreshWorkspace(true);
+}
+async function createChat() {
+  const id = current.value?.id;
+  if (!id || creatingChat.value) return;
+  const token = viewToken;
+  creatingChat.value = true;
+  workspaceError.value = '';
+  try {
+    const chat = await api<ProjectChat>('projects/' + id + '/chats', 'POST', {});
+    if (token !== viewToken) return;
+    if (!chats.value.some((item) => item.id === chat.id)) chats.value = [chat, ...chats.value];
+    await selectChat(chat.id);
+  } catch (error) {
+    if (token === viewToken) workspaceError.value = message(error);
+  } finally {
+    if (token === viewToken) creatingChat.value = false;
+  }
+}
 async function back() {
   resetWorkspace();
   setUrl();
   try { await loadProjects(); } catch (error) { pageError.value = message(error); }
 }
-async function refreshWorkspace() {
+async function refreshWorkspace(force = false) {
   const id = current.value?.id;
-  if (!id || polling) return;
+  if (!id || (polling && !force)) return;
   const token = viewToken;
-  polling = true;
+  const chat = selectedChat.value;
+  const request = Symbol();
+  polling = request;
   try {
-    const result = await api<{ project: Project; messages: Conversation[] }>('projects/' + id);
-    if (token !== viewToken) return;
+    const result = await workspaceData(id, chat);
+    if (token !== viewToken || polling !== request) return;
+    pollError.value = '';
     const changed = result.project.revision !== current.value?.revision;
     const changedDraft = result.project.draftRevision !== current.value?.draftRevision;
     const differentStatus = result.project.preview !== current.value?.preview;
     const changedHistory = result.messages.length !== history.value.length || result.messages.at(-1)?.state !== history.value.at(-1)?.state;
     const changedAgentEvents = result.messages.at(-1)?.agent_events?.length !== history.value.at(-1)?.agent_events?.length;
     const atBottom = thread.value && thread.value.scrollHeight - thread.value.scrollTop - thread.value.clientHeight < 36;
-    current.value = result.project;
-    history.value = result.messages;
+    updateWorkspace(result);
     for (const id of expandedReasoning) if (!completedReasoning.has(id)) void readReasoning(id);
     if (changedHistory || (changedAgentEvents && atBottom)) scrollThread();
     if (changed || differentStatus || changedDraft) {
@@ -295,9 +362,15 @@ async function refreshWorkspace() {
       if (changed && tab.value === 'source') await loadSource();
     }
   } catch (error) {
-    if (token === viewToken) workspaceError.value = message(error);
+    if (token === viewToken && polling === request) {
+      pollError.value = error instanceof ApiError && error.status === 0
+        ? '暂时无法刷新对话，正在自动重连。' : message(error);
+    }
   } finally {
-    polling = false;
+    if (polling === request) {
+      polling = undefined;
+      if (token === viewToken) loadingChat.value = false;
+    }
   }
 }
 async function loadPreview() {
@@ -332,16 +405,16 @@ function setTab(next: 'preview' | 'source') {
   tab.value = next;
   if (next === 'source' && source.value?.revision !== current.value?.revision) void loadSource();
 }
-async function runPreview(start: boolean) {
+async function runPreview(start: boolean, draft = false) {
   if (!current.value) return;
   const token = viewToken;
   starting.value = true;
   previewError.value = '';
   try {
-    const updated = await api<Project>('projects/' + current.value.id + '/preview/' + (start ? 'start' : 'stop'), 'POST', {});
+    const updated = await api<Project>('projects/' + current.value.id + '/preview/' + (start ? 'start' : 'stop'), 'POST', { draft });
     if (token !== viewToken) return;
     current.value = updated;
-    if (start) await loadPreview();
+    if (start || updated.preview === 'running' || updated.draftRevision) await loadPreview();
     else { renderToken++; preview.value = null; }
   } catch (error) {
     if (token === viewToken) previewError.value = message(error);
@@ -349,17 +422,22 @@ async function runPreview(start: boolean) {
     if (token === viewToken) starting.value = false;
   }
 }
-async function generate(value = prompt.value, retryModel?: string) {
-  if (!current.value || running.value || sending.value || !value.trim()) return;
+async function generate(value = prompt.value, retryModel?: string, resumeMessageId?: string) {
+  if (!current.value || running.value || sending.value || loadingChat.value || !value.trim()) return;
   const token = viewToken;
+  const chatId = selectedChat.value;
   sending.value = true;
   workspaceError.value = '';
   const modelId = retryModel && models.value.some((model) => model.id === retryModel && model.available) ? retryModel : selectedModel.value;
   try {
-    await api('projects/' + current.value.id + '/generate', 'POST', { prompt: value.trim(), modelId });
+    await api('projects/' + current.value.id + '/generate', 'POST', { prompt: value.trim(), modelId, chatId: chatId || null, resumeMessageId });
     if (token !== viewToken) return;
-    if (!retryModel) prompt.value = '';
-    await refreshWorkspace();
+    if (resumeMessageId) completedReasoning.delete(resumeMessageId);
+    if (!retryModel) {
+      chatDrafts.delete(chatId);
+      if (chatId === selectedChat.value) prompt.value = '';
+    }
+    await refreshWorkspace(true);
   } catch (error) {
     if (token === viewToken) workspaceError.value = message(error);
   } finally {
@@ -374,7 +452,7 @@ async function stopGeneration() {
   workspaceError.value = '';
   try {
     await api('projects/' + current.value.id + '/messages/' + item.id + '/stop', 'POST', {});
-    if (token === viewToken) await refreshWorkspace();
+    if (token === viewToken) await refreshWorkspace(true);
   } catch (error) {
     if (token === viewToken) workspaceError.value = message(error);
   } finally {
@@ -567,12 +645,20 @@ onUnmounted(() => {
 
     <main v-else class="workspace">
       <aside class="conversation">
-        <header class="pane-head"><strong>建站对话</strong></header>
+        <header class="pane-head chat-head">
+          <strong>建站对话</strong>
+          <select :value="selectedChat" aria-label="切换对话" @change="selectChat(($event.target as HTMLSelectElement).value)">
+            <option value="">默认对话</option>
+            <option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }}</option>
+          </select>
+          <button class="quiet" type="button" :disabled="creatingChat" @click="createChat"><Plus :size="16" /> 新建对话</button>
+        </header>
         <div ref="thread" class="thread" aria-live="polite">
-          <div v-if="!history.length" class="empty-thread">
+          <p v-if="loadingChat" class="meta">正在加载对话…</p>
+          <div v-else-if="!history.length" class="empty-thread">
             <span class="large-icon"><Sparkles :size="22" /></span>
-            <h2>你想做什么网站？</h2>
-            <p>说说要实现的功能，生成后可以继续在这里修改。</p>
+            <h2>{{ current.revision ? '这次想做什么？' : '你想做什么网站？' }}</h2>
+            <p>{{ current.revision ? '可以提问，也可以继续修改当前网站。' : '说说要实现的功能，生成后可以继续在这里修改。' }}</p>
           </div>
           <div v-for="item in history" :key="item.id" class="message-pair">
             <div class="user-message">{{ item.prompt }}</div>
@@ -582,7 +668,7 @@ onUnmounted(() => {
                 <span class="meta">{{ item.model_name }} · {{ item.state === 'running' ? '处理中' : item.state === 'failed' ? '处理失败' : item.state === 'stopped' ? '已停止' : item.result_type === 'answer' ? '已回复' : '已生成' }}</span>
                 <div v-if="item.state === 'failed'" class="generation-error">
                   <p class="danger-text" role="alert"><CircleAlert :size="16" aria-hidden="true" /><span>{{ item.response }}</span></p>
-                  <button class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id)"><RotateCw :size="14" /> 重试</button>
+                  <button class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '从检查点继续' : '重试' }}</button>
                 </div>
                 <AgentProgress v-if="item.agent_events?.length" :events="item.agent_events" :state="item.state" />
                 <details v-if="item.has_reasoning" class="reasoning" @toggle="toggleReasoning($event, item)">
@@ -593,7 +679,7 @@ onUnmounted(() => {
                 </details>
                 <p v-if="item.state === 'running'" class="in-progress"><LoaderCircle class="spin" :size="16" /> {{ item.agent_progress || '正在处理你的请求…' }}</p>
                 <p v-else-if="item.state !== 'failed'">{{ item.response }}</p>
-                <button v-if="item.state === 'stopped'" class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id)"><RotateCw :size="14" /> 重试</button>
+                <button v-if="item.state === 'stopped'" class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '从检查点继续' : '重试' }}</button>
               </div>
             </div>
           </div>
@@ -605,7 +691,7 @@ onUnmounted(() => {
           <div v-else-if="activeModel?.source === 'demo'" class="model-note">
             <CircleAlert :size="15" /><span>离线样例只生成待办网站。<button class="link" @click="sample">{{ current.revision ? '填入修改示例' : '填入需求示例' }}</button></span>
           </div>
-          <p v-if="workspaceError" class="error" role="alert">{{ workspaceError }}</p>
+          <p v-if="workspaceError || pollError" class="error" role="alert">{{ workspaceError || pollError }}</p>
           <form class="composer" @submit.prevent="generate()">
             <textarea v-model="prompt" aria-label="建站需求" :placeholder="current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
             <div class="composer-actions">
@@ -615,8 +701,9 @@ onUnmounted(() => {
                 </select>
                 <button class="icon" aria-label="打开模型设置" type="button" @click="showModels"><Settings2 :size="17" /></button>
               </div>
-              <button v-if="activeGeneration" class="stop-generation" type="button" :disabled="stopping || activeGeneration.agent_progress === '正在停止生成…'" @click="stopGeneration"><Square :size="14" /> {{ stopping || activeGeneration.agent_progress === '正在停止生成…' ? '正在停止…' : '停止生成' }}</button>
-              <button v-else class="primary send" type="submit" :disabled="!prompt.trim() || !activeModel?.available || sending"><Send :size="15" /> 发送</button>
+              <button v-if="activeGeneration && runningInAnotherChat" class="quiet" type="button" @click="selectChat(activeGeneration.chat_id ?? '')"><LoaderCircle class="spin" :size="14" /> 查看正在生成的对话</button>
+              <button v-else-if="activeGeneration" class="stop-generation" type="button" :disabled="stopping || activeGeneration.agent_progress === '正在停止生成…'" @click="stopGeneration"><Square :size="14" /> {{ stopping || activeGeneration.agent_progress === '正在停止生成…' ? '正在停止…' : '停止生成' }}</button>
+              <button v-else class="primary send" type="submit" :disabled="!prompt.trim() || !activeModel?.available || sending || loadingChat"><Send :size="15" /> 发送</button>
             </div>
           </form>
         </div>
@@ -628,9 +715,10 @@ onUnmounted(() => {
             <button :aria-pressed="tab === 'source'" @click="setTab('source')"><Code2 :size="18" /> 源码</button>
           </div>
           <div v-if="tab === 'preview'" class="preview-actions">
-            <span class="status" :class="current.draftRevision ? 'starting' : current.preview"><i></i>{{ starting ? '处理中' : current.revision || current.draftRevision ? stateLabel(current) : '未生成' }}</span>
+            <span class="status" :class="current.draftRevision ? 'starting' : current.preview"><i></i>{{ starting ? '处理中' : current.revision || current.draftRevision || current.hasSavedDraft ? stateLabel(current) : '未生成' }}</span>
             <button v-if="current.revision" type="button" @click="manageShare('open')"><Link2 :size="16" /> 分享预览</button>
-            <template v-if="current.preview === 'running'">
+            <button v-if="current.hasSavedDraft && !current.draftRevision" type="button" :disabled="starting" @click="runPreview(true, true)"><Play :size="15" /> 预览候选</button>
+            <template v-if="current.preview === 'running' || current.draftRevision">
               <button class="icon" type="button" title="刷新预览" aria-label="刷新预览" @click="loadPreview"><RotateCw :size="16" /></button>
               <button class="quiet" type="button" :disabled="starting" @click="runPreview(false)"><Square :size="14" /> 停止</button>
             </template>
@@ -643,8 +731,8 @@ onUnmounted(() => {
           <PreviewFrame v-if="preview" :key="previewReload" :request-path="'projects/' + current.id + '/preview/request'" :value="preview" @expired="refreshWorkspace" />
           <div v-else class="empty-preview">
             <span class="large-icon"><Monitor :size="27" /></span>
-            <h2>{{ starting ? '正在准备预览' : current.revision ? '预览已停止' : running ? '正在生成首版' : '还没有预览' }}</h2>
-            <p>{{ current.revision ? '启动后可以在这里试用网站。' : running ? '首个候选版本启动后会显示在这里。' : '生成首版后可以在这里试用网站。' }}</p>
+            <h2>{{ starting ? '正在准备预览' : current.revision ? '预览已停止' : current.hasSavedDraft ? '候选版本已保存' : running ? '正在生成首版' : '还没有预览' }}</h2>
+            <p>{{ current.revision ? '启动后可以在这里试用网站。' : current.hasSavedDraft ? '可打开已保存的候选版本查看进度。' : running ? '首个候选版本启动后会显示在这里。' : '生成首版后可以在这里试用网站。' }}</p>
             <button v-if="current.revision && !starting" @click="runPreview(true)"><Play :size="16" /> 启动预览</button>
           </div>
         </div>

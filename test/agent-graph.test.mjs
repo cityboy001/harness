@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { buildProject } from '../server/agent-workflow.mjs';
 import { mergeWorkerChanges } from '../server/generation.mjs';
 import { ModelOutputLimitError, PublicError } from '../server/models.mjs';
-import { readyTasks } from '../server/task-plan.mjs';
+import { readyTasks, validateTasks } from '../server/task-plan.mjs';
 
 const config = { platform: true };
 const files = {
@@ -62,12 +62,208 @@ const readBeforeEdit = (path, operation) => (messages, call) => {
   }] } } : { read: [path] };
 };
 
+const scopedTask = (id, capability, { read = [], write = [], evidence = [], dependsOn = [] } = {}) => ({
+  ...makeTask(id, capability, dependsOn),
+  files: { read, write }, evidence,
+  outputFormat: { edit_project: 'patch', read_project: 'report', analyze: 'report', browser: 'browser_tests' }[capability]
+});
+
+test('supervisor collects project state, source and preview evidence before choosing direct execution', async () => {
+  let plans = 0;
+  const run = scenario([
+    [planning, (messages) => {
+      const { observations, explorationRemaining } = context(messages);
+      assert.equal(explorationRemaining, 4 - plans);
+      switch (plans++) {
+        case 0: return { explore: { tool: 'project_state' } };
+        case 1:
+          assert.equal(observations['obs-1'].hasExistingVersion, true);
+          return { explore: { tool: 'read_project', paths: ['index.html'] } };
+        case 2:
+          assert.deepEqual(observations['obs-2'], { 'index.html': files['index.html'] });
+          return { explore: { tool: 'inspect_preview', actions: [{ action: 'inspect' }] } };
+        default:
+          assert.equal(observations['obs-3'].dom, 'Observed button');
+          return { mode: 'direct' };
+      }
+    }],
+    [generation, (messages) => {
+      assert.match(messages[1].content, /Observed button/);
+      return { answer: 'The existing preview has a button.' };
+    }]
+  ], { files, testBrowser(candidate, steps) {
+    assert.deepEqual(candidate, files);
+    assert.deepEqual(JSON.parse(JSON.stringify(steps)), [{ action: 'inspect' }]);
+    return { status: 'passed', dom: 'Observed button' };
+  }, onCandidate() { assert.fail('Exploration must not publish a candidate'); } });
+  assert.equal((await run.result).files, null);
+  assert.deepEqual(steps(run.trace), ['orchestrate', 'explore', 'orchestrate', 'explore', 'orchestrate', 'explore', 'orchestrate', 'direct']);
+});
+
+test('task validation checks evidence, output and paths, then schedules by file conflicts rather than capability names', () => {
+  const observations = { 'obs-1': { result: 'Prior state' } };
+  const checkout = scopedTask('checkout', 'edit_project', { write: ['index.html', 'server.js'], evidence: ['obs-1'] });
+  const styling = scopedTask('styling', 'edit_project', { write: ['style.css'] });
+  const order = scopedTask('order', 'edit_project', { read: ['server.js'], write: ['order.js'] });
+  const tasks = validateTasks([checkout, styling, order], 'team', [], observations);
+  assert.deepEqual(readyTasks(tasks, {}).map(({ id }) => id), ['checkout', 'styling']);
+  for (const invalid of [
+    { ...checkout, evidence: ['unknown'] }, { ...checkout, outputFormat: 'report' },
+    { ...checkout, files: { read: [], write: ['../server.js'] } },
+    { ...checkout, dependsOn: ['checkout'] }
+  ]) assert.equal(validateTasks([invalid], 'team', [], observations), null);
+});
+
+test('browser failure triggers evidence gathering and a repair DAG before replaying the same acceptance', async () => {
+  const crossLayer = scopedTask('checkout', 'edit_project', { write: ['index.html', 'server.js'], evidence: ['obs-1'] });
+  const inspect = scopedTask('inspect-checkout', 'read_project', { read: ['server.js'], evidence: ['obs-2'] });
+  const repairTask = scopedTask('handle-checkout', 'edit_project', { write: ['server.js'], dependsOn: [inspect.id] });
+  let checks = 0;
+  let repairCalls = 0;
+  const run = scenario([
+    [planning, (messages) => Object.keys(context(messages).observations).length
+      ? { ...team, schemaVersion: 2, tasks: [crossLayer] }
+      : { explore: { tool: 'project_state' } }],
+    [repair, (messages) => {
+      const input = context(messages);
+      assert.equal(input.failure.failedStep.action, 'assert_text');
+      assert.deepEqual(input.tests, actions);
+      if (++repairCalls === 1) return { explore: { tool: 'read_project', paths: ['server.js'] } };
+      assert.match(input.observations['obs-2']['server.js'], /failed/);
+      return { schemaVersion: 2, tasks: [inspect, repairTask] };
+    }],
+    [reading, (messages) => {
+      assert.deepEqual(context(messages).files, ['server.js']);
+      assert.match(context(messages).evidence['obs-2']['server.js'], /failed/);
+      return { result: 'Repair the response body.' };
+    }],
+    ['You are a project editing worker', (messages) => {
+      const input = JSON.parse(messages[1].content.split('USER REQUEST:\n')[1].split('\nPROJECT FILE MANIFEST:')[0]);
+      if (input.assignment === crossLayer.id) {
+        assert.equal(input.evidence['obs-1'].hasExistingVersion, false);
+        return { changes: { 'index.html': files['index.html'], 'server.js': 'function handle(){return {status:200,body:"failed"}}' } };
+      }
+      assert.equal(input.dependencies[inspect.id], 'Repair the response body.');
+      if (messages.length === 2) return { read: ['server.js'] };
+      return { changes: { 'server.js': 'function handle(){return {status:200,body:"fixed"}}' } };
+    }]
+  ], { testBrowser(candidate, tests) {
+    assert.deepEqual(JSON.parse(JSON.stringify(tests)), actions);
+    if (++checks === 1) return { status: 'failed', steps: [{ ok: true }, { ok: false, error: 'Missing checkout result' }] };
+    assert.match(candidate['server.js'], /fixed/);
+    return { status: 'passed' };
+  } });
+  assert.match((await run.result).files['server.js'], /fixed/);
+  assert.equal(checks, 2);
+  assert.equal(repairCalls, 2);
+  assert.deepEqual(run.events.filter(({ kind, role }) => kind === 'assign' && role === 'edit_project')
+    .map(({ taskId }) => taskId), [crossLayer.id, repairTask.id]);
+});
+
+test('out-of-scope patches are rejected atomically and a repaired dependency unblocks its consumer', async () => {
+  const writer = scopedTask('checkout', 'edit_project', { write: ['checkout.js'] });
+  const consumer = scopedTask('style-checkout', 'edit_project', { read: ['checkout.js'], write: ['style.css'], dependsOn: [writer.id] });
+  const run = scenario([
+    [planning, { ...team, schemaVersion: 2, tasks: [writer, consumer] }],
+    [repair, (messages) => {
+      const input = context(messages);
+      assert.equal(input.failure.workerErrors[0].id, writer.id);
+      assert.match(input.failure.workerErrors[0].error, /范围之外/);
+      assert.ok(!input.files.includes('outside.js') && !input.files.includes('checkout.js'));
+      if (!input.validationError) return { schemaVersion: 2, tasks: [consumer] };
+      assert.match(input.validationError, /Reuse failed task IDs/);
+      return { schemaVersion: 2, tasks: [writer] };
+    }],
+    ['You are a project editing worker', (messages) => {
+      const input = JSON.parse(messages[1].content.split('USER REQUEST:\n')[1].split('\nPROJECT FILE MANIFEST:')[0]);
+      if (input.assignment === consumer.id) {
+        assert.deepEqual(Object.keys(input.dependencies), [writer.id]);
+        return changed('style.css', 'button { color: blue }');
+      }
+      const patch = changed('checkout.js', 'const ready = true;');
+      if (!input.failureEvidence) patch.changes['outside.js'] = 'const forbidden = true;';
+      return patch;
+    }]
+  ], { files, testBrowser(candidate) {
+    assert.equal(candidate['checkout.js'], 'const ready = true;');
+    assert.ok(Object.hasOwn(candidate, 'style.css'));
+    assert.ok(!Object.hasOwn(candidate, 'outside.js'));
+    return { status: 'passed' };
+  } });
+  assert.ok((await run.result).files);
+  assert.deepEqual(run.events.filter(({ kind, role }) => kind === 'assign' && role === 'edit_project')
+    .map(({ taskId }) => taskId), [writer.id, consumer.id, writer.id]);
+});
+
+test('an oversized patch gets a file-specific correction and invalid repair plans retry the original scoped task', async () => {
+  const backendTask = scopedTask('backend-api', 'edit_project', { write: ['backend.js'] });
+  const shell = scopedTask('frontend-shell', 'edit_project', { write: ['shell.html'], dependsOn: [backendTask.id] });
+  const consumer = scopedTask('order-flow', 'edit_project', { write: ['orders.js'], dependsOn: [shell.id] });
+  let repairCalls = 0;
+  let attempts = 0;
+  const run = scenario([
+    [planning, { ...team, schemaVersion: 2, tasks: [backendTask, shell, consumer] }],
+    [repair, (messages) => {
+      const input = context(messages);
+      assert.match(input.failure.workerErrors[0].error, /shell\.html.*48001.*48000/);
+      assert.equal(input.completed[backendTask.id].ok, true);
+      repairCalls++;
+      return { schemaVersion: 2, tasks: [consumer] };
+    }],
+    ['You are a project editing worker', (messages) => {
+      const input = JSON.parse(messages[1].content.split('USER REQUEST:\n')[1].split('\nPROJECT FILE MANIFEST:')[0]);
+      if (input.assignment === backendTask.id) return changed('backend.js', 'const backend = true;');
+      if (input.assignment === consumer.id) {
+        assert.ok(Object.hasOwn(input.dependencies, shell.id));
+        return changed('orders.js', 'const orders = true;');
+      }
+      assert.ok(Object.hasOwn(input.dependencies, backendTask.id));
+      assert.deepEqual(input.fileScope.write, ['shell.html']);
+      if (input.failureEvidence) return changed('shell.html', '<main></main>');
+      if (++attempts === 2) assert.ok(messages.some(({ content }) => /Validation error:.*shell\.html.*48001.*48000/.test(content)));
+      return changed('shell.html', 'x'.repeat(48001));
+    }]
+  ], { files, testBrowser(candidate) {
+    assert.equal(candidate['shell.html'], '<main></main>');
+    assert.ok(candidate['orders.js']);
+    return { status: 'passed' };
+  } });
+  assert.ok((await run.result).files);
+  assert.equal(attempts, 2);
+  assert.equal(repairCalls, 2);
+  assert.deepEqual(run.events.filter(({ kind, round }) => kind === 'assign' && round === 1).map(({ taskId }) => taskId), [shell.id]);
+});
+
+test('the supervisor sees direct browser failure evidence and can switch to a task DAG', async () => {
+  let decisions = 0;
+  let failedChecks = 0;
+  const run = scenario([
+    [planning, (messages) => {
+      if (++decisions === 1) return { mode: 'direct' };
+      assert.equal(context(messages).failure.error, 'Failed to mount checkout');
+      assert.equal(context(messages).failure.dom, 'Observed broken checkout');
+      return { ...team, schemaVersion: 2, tasks: [scopedTask('checkout', 'edit_project', { write: Object.keys(files) })] };
+    }],
+    ['You are a project editing worker', { changes: files }],
+    [generation, { files: { ...files, 'index.html': '<p>broken</p>' } }]
+  ], { testBrowser(candidate) {
+    if (candidate['index.html'].includes('broken')) {
+      failedChecks++;
+      return { status: 'failed', error: 'Failed to mount checkout', dom: 'Observed broken checkout' };
+    }
+    return { status: 'passed' };
+  } });
+  assert.equal((await run.result).files['index.html'], files['index.html']);
+  assert.ok(failedChecks >= 1);
+  assert.equal(decisions, 2);
+});
+
 test('planning accepts an explicit direct replan and direct emits no file changes for a question', async () => {
   let plans = 0;
   const run = scenario([
     [planning, (messages) => {
       if (++plans === 1) return { ...team, tasks: [makeTask('ui', 'frontend')] };
-      assert.match(context(messages).validationError, /both frontend and backend/);
+      assert.match(context(messages).validationError, /index.html and server.js/);
       assert.equal(context(messages).rejectedPlan.tasks[0].id, 'ui');
       return { mode: 'direct' };
     }],
@@ -451,12 +647,12 @@ test('verification review may correct a selector but cannot drop the post-scroll
         assert.equal(output.files['index.html'], '<p>Gallery version 2</p>');
       } else {
         await assert.rejects(run.result, {
-          statusCode: 422, message: /连续 3 次遇到同一错误[\s\S]*第 2 步[\s\S]*\.wrong-card[\s\S]*24/
+          statusCode: 422, message: /修复 20 轮后仍未通过验收[\s\S]*第 2 步[\s\S]*\.wrong-card[\s\S]*24/
         });
       }
       assert.equal(reviews, 1);
-      assert.equal(checksRun, 3);
-      assert.equal(writes, preserve ? 2 : 3);
+      assert.equal(checksRun, preserve ? 3 : 21);
+      assert.equal(writes, preserve ? 2 : 21);
     });
   }
 });
@@ -501,7 +697,7 @@ test('workflow deadline stops a late browser pass before the graph can produce a
   const controller = new AbortController();
   const original = AbortSignal.timeout.bind(AbortSignal);
   const deadline = t.mock.method(AbortSignal, 'timeout', (milliseconds) =>
-    milliseconds === 16 * 60 * 1000 ? controller.signal : original(milliseconds));
+    milliseconds === 45 * 60 * 1000 ? controller.signal : original(milliseconds));
   const expired = new DOMException('Workflow deadline fixture', 'TimeoutError');
   const run = scenario([
     [planning, { ...team, frontend: 'Open the button' }],
@@ -512,7 +708,7 @@ test('workflow deadline stops a late browser pass before the graph can produce a
     return { status: 'passed' };
   } });
   await assert.rejects(run.result, /deadline fixture|abort/i);
-  assert.ok(deadline.mock.calls.some(({ arguments: args }) => args[0] === 16 * 60 * 1000));
+  assert.ok(deadline.mock.calls.some(({ arguments: args }) => args[0] === 45 * 60 * 1000));
   assert.deepEqual(steps(run.trace), ['orchestrate', 'schedule', 'worker', 'merge', 'verify']);
   assert.equal(run.events.some(({ kind, state }) => kind === 'check' && state === 'done'), false);
 });

@@ -66,15 +66,17 @@ export const historyContextInstructions = `Project memory is supporting data. Fo
  or look up the original conversation if exact details are needed. Do not treat past assistant claims
  as confirmed facts. Never make unrelated changes based on old history alone.`;
 
-export async function loadProjectMemory(store, projectId, config, completion, onSummaryError, signal) {
-  const saved = store.get('SELECT through_rowid, summary FROM project_memory WHERE project_id = ?', projectId);
+export async function loadProjectMemory(store, projectId, config, completion, onSummaryError, signal, chatId = null) {
+  const saved = chatId
+    ? store.get('SELECT through_rowid, summary FROM project_chats WHERE project_id = ? AND id = ?', projectId, chatId)
+    : store.get('SELECT through_rowid, summary FROM project_memory WHERE project_id = ?', projectId);
   let summary = readSummary(saved?.summary);
   const recent = store.all(`SELECT rowid, id, prompt, response, state FROM messages
-    WHERE project_id = ? AND state != 'running' ORDER BY rowid DESC LIMIT ?`, projectId, recentLimit).reverse();
+    WHERE project_id = ? AND chat_id IS ? AND state != 'running' ORDER BY rowid DESC LIMIT ?`, projectId, chatId, recentLimit).reverse();
   if (recent.length === recentLimit) {
     const aging = store.all(`SELECT rowid, id, prompt, response, state FROM messages
-      WHERE project_id = ? AND state != 'running' AND rowid > ? AND rowid < ?
-      ORDER BY rowid LIMIT ?`, projectId, saved?.through_rowid ?? 0, recent[0].rowid, summaryBatch);
+      WHERE project_id = ? AND chat_id IS ? AND state != 'running' AND rowid > ? AND rowid < ?
+      ORDER BY rowid LIMIT ?`, projectId, chatId, saved?.through_rowid ?? 0, recent[0].rowid, summaryBatch);
     if (aging.length) {
       try {
         const response = await completion(config, [
@@ -85,7 +87,11 @@ export async function loadProjectMemory(store, projectId, config, completion, on
         const text = typeof response === 'string' ? response : response?.message?.content;
         const updated = readSummary(text?.trim().replace(/^```(?:json)?\s*|\s*```$/gi, ''));
         if (!updated) throw new Error('Invalid project memory summary');
-        store.run(`INSERT INTO project_memory (project_id, through_rowid, summary, updated)
+        if (chatId) {
+          store.run(`UPDATE project_chats SET through_rowid = ?, summary = ?
+            WHERE project_id = ? AND id = ? AND coalesce(through_rowid, 0) < ?`,
+          aging.at(-1).rowid, JSON.stringify(updated), projectId, chatId, aging.at(-1).rowid);
+        } else store.run(`INSERT INTO project_memory (project_id, through_rowid, summary, updated)
           SELECT id, ?, ?, ? FROM projects WHERE id = ?
           ON CONFLICT(project_id) DO UPDATE SET through_rowid = excluded.through_rowid,
           summary = excluded.summary, updated = excluded.updated
@@ -111,14 +117,14 @@ export async function loadProjectMemory(store, projectId, config, completion, on
       let query;
       if (typeof value?.turnId === 'string' && /^[a-f0-9]{32}$/.test(value.turnId)) {
         matches = store.all(`SELECT id, prompt, response, state FROM messages
-          WHERE project_id = ? AND id = ? AND state != 'running'`, projectId, value.turnId);
+          WHERE project_id = ? AND chat_id IS ? AND id = ? AND state != 'running'`, projectId, chatId, value.turnId);
       } else {
         query = brief(value?.query, 100);
         if (query.length < 2) return JSON.stringify({ error: 'Specify a short phrase or an exact turn ID.' });
         matches = store.all(`SELECT id, prompt, response, state FROM messages
-          WHERE project_id = ? AND state != 'running'
+          WHERE project_id = ? AND chat_id IS ? AND state != 'running'
           AND (instr(lower(prompt), lower(?)) > 0 OR instr(lower(response), lower(?)) > 0)
-          ORDER BY rowid DESC LIMIT 2`, projectId, query, query);
+          ORDER BY rowid DESC LIMIT 2`, projectId, chatId, query, query);
       }
       return JSON.stringify({ matches: matches.map((row) => formatTurn(row, query ? 2300 : 6000, query)) });
     }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildProject } from '../server/agent-workflow.mjs';
+import { previewTestActions } from '../server/generation-browser.mjs';
 import { browserTest } from '../server/browser-runner.mjs';
 
 const executablePath = process.env.BUILDER_TEST_CHROMIUM;
@@ -54,11 +55,27 @@ test('a visible-text assertion can find a visible match after a hidden duplicate
   skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable',
   timeout: 12000
 }, async () => {
+  const page = '<p hidden>当归片</p><p>当归片</p><!--';
+  const html = page + ' '.repeat(24735 - Buffer.byteLength(page) - 3) + '-->';
   const result = await browserTest({
-    files: { 'index.html': '<p hidden>当归片</p><p>当归片</p>', 'server.js': files['server.js'] },
+    files: { 'index.html': html, 'server.js': files['server.js'] },
     actions: [{ action: 'assert_text', value: '当归片' }]
   }, { executablePath });
   assert.equal(result.status, 'passed', JSON.stringify(result.steps));
+});
+
+test('real preview accepts a rewritten static navigation selector after scoped interactions', {
+  skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable', timeout: 12000
+}, async () => {
+  const website = { ...files, 'index.html': '<button class="add" id="first">加购 A</button><button class="add">加购 B</button><a href="admin.html">后台</a>',
+    'admin.html': '<h1>后台管理</h1>' };
+  const ambiguous = await browserTest({ files: website, actions: [{ action: 'click', selector: '.add' }] }, { executablePath });
+  assert.match(ambiguous.steps[0].error, /strict mode violation/);
+  const fixed = await browserTest({ files: website, actions: previewTestActions([
+    { action: 'click', selector: '#first' }, { action: 'click', selector: 'a[href="admin.html"]' },
+    { action: 'assert_text', value: '后台管理' }
+  ]) }, { executablePath });
+  assert.equal(fixed.status, 'passed', JSON.stringify(fixed));
 });
 
 test('real Chromium evidence drives a scoped repair and replays the original create, list and edit scenario', {
@@ -71,7 +88,7 @@ test('real Chromium evidence drives a scoped repair and replays the original cre
     files, async (_config, messages) => {
       const instruction = messages[0].content;
       if (instruction.startsWith('You are the central planning agent')) {
-        return '{"mode":"investigate","goal":"新增、列表、编辑","allowRepair":true}';
+        return '{"mode":"investigate","schemaVersion":2,"goal":"新增、列表、编辑","allowRepair":true}';
       }
       if (instruction.startsWith('You are the browser acceptance agent')) return JSON.stringify({ tests: actions });
       if (instruction.startsWith('You are the central agent reviewing a real browser investigation')) {
@@ -83,12 +100,17 @@ test('real Chromium evidence drives a scoped repair and replays the original cre
           { method: 'GET', path: '/api/herbs', status: 200, response: { type: 'array', length: 1 } }
         ]);
         assert.doesNotMatch(JSON.stringify(failure.api), /测试药材/);
-        return '{"decision":"repair","frontend":"Read the response payload directly."}';
+        return JSON.stringify({ decision: 'repair', schemaVersion: 2, tasks: [{
+          id: 'decode-herbs', title: '修正药材响应解析', capability: 'edit_project', outputFormat: 'patch',
+          goal: 'Read the response payload directly.', dependsOn: [], evidence: [],
+          acceptance: 'Create and edit a single herb and show the saved data in the list.',
+          files: { read: [], write: ['app.js'] }
+        }] });
       }
-      assert.match(instruction, /frontend sub-agent/);
+      assert.match(instruction, /project editing worker/);
       assert.equal(checked.length, 2);
       if (messages.length === 2) return '{"read":["app.js"]}';
-      assert.match(messages.at(-1).content, /return payload\.body/);
+      assert.ok(messages.some(({ role, content }) => role === 'user' && /return payload\.body/.test(content)));
       return JSON.stringify({ edits: [{ path: 'app.js', before: 'return payload.body;', after: 'return payload;' }] });
     }, {
       maxTokens: 32000,

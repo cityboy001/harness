@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import Fastify, { LogController } from 'fastify';
 import { chatCompletion, isDeepSeek, parseEndpoint, PublicError } from './models.mjs';
 import { buildProject } from './agent-workflow.mjs';
+import { GenerationCheckpointer } from './generation-checkpoints.mjs';
 import { loadProjectMemory } from './project-memory.mjs';
 import { makeBrowserTester } from './browser-tester.mjs';
 import { previewInput } from './preview-requests.mjs';
@@ -48,6 +49,7 @@ export async function createApp(config) {
   });
   const shareWindow = config.shareWindow ?? 86400000;
   const tasks = new Map();
+  let closing = false;
   const draftPreviews = new Map();
   const completion = config.completion ?? chatCompletion;
   const testBrowser = config.testBrowser ?? makeBrowserTester(config.browserLauncher);
@@ -89,6 +91,14 @@ export async function createApp(config) {
     return found;
   }
   const ownedProject = (request) => project(request.params.id, user(request).id);
+  function projectChat(projectId, value) {
+    if (value == null) return null;
+    const chat = field(value, '对话', 64);
+    if (!store.get('SELECT id FROM project_chats WHERE id = ? AND project_id = ?', chat, projectId)) {
+      throw new PublicError(404, '找不到这条对话。');
+    }
+    return chat;
+  }
   function revision(item) {
     if (!item.active_revision) throw new PublicError(409, '请先生成一个网站版本。');
     return store.get('SELECT id, version, files FROM revisions WHERE project_id = ? AND id = ?', item.id, item.active_revision);
@@ -125,11 +135,38 @@ export async function createApp(config) {
   expiryTimer.unref();
   const projectView = (item) => ({
     id: item.id, name: item.name, updated: item.updated, revision: item.active_revision, preview: preview.status(item.id),
-    draftRevision: activeDraft(item)?.id ?? null
+    draftRevision: activeDraft(item)?.id ?? null, hasSavedDraft: Boolean(savedDraft(item))
   });
   function activeDraft(item) {
     const draft = draftPreviews.get(item.id);
-    return !item.active_revision && draft && preview.status(draft.key) === 'running' ? draft : undefined;
+    return draft && draft.baseRevision === item.active_revision && preview.status(draft.key) === 'running' ? draft : undefined;
+  }
+  function savedDraft(item) {
+    return store.get(`SELECT generation_runs.message_id, draft_id AS id FROM generation_runs
+      JOIN messages ON messages.id = generation_runs.message_id
+      WHERE messages.project_id = ? AND generation_runs.base_revision IS ? AND draft_id IS NOT NULL
+      ORDER BY messages.created DESC, messages.rowid DESC LIMIT 1`, item.id, item.active_revision);
+  }
+  async function startDraft(item, saved, signal) {
+    const key = 'draft:' + saved.message_id;
+    const draft = { id: saved.id, key, files: saved.files, baseRevision: item.active_revision };
+    const current = { ...item, id: key, active_revision: draft.id };
+    const previous = draftPreviews.get(item.id);
+    if (previous && (previous.key !== key || previous.id !== draft.id)) {
+      await preview.delete(previous.key, () => [{ id: previous.id }]);
+      if (draftPreviews.get(item.id) === previous) draftPreviews.delete(item.id);
+    }
+    await preview.start(current, () => ({
+      current, revision: draft,
+      initialize() {
+        signal?.throwIfAborted();
+        if (project(item.id, item.user_id).active_revision !== item.active_revision) {
+          throw new PublicError(409, '项目版本已更新，请刷新。');
+        }
+        draftPreviews.set(item.id, draft);
+      }
+    }), signal);
+    return draft;
   }
   function modelRow(modelId, owner) {
     const model = store.get('SELECT * FROM models WHERE id = ? AND user_id = ?', modelId, owner);
@@ -214,13 +251,24 @@ export async function createApp(config) {
   });
   route('GET', '/projects/:id', async (request) => {
     const item = ownedProject(request);
+    const chat = projectChat(item.id, request.query.chat);
+    const chats = store.all("SELECT id, coalesce(title, '新对话') AS title FROM project_chats WHERE project_id = ? ORDER BY created DESC, rowid DESC", item.id);
+    const activeGeneration = store.get("SELECT id, chat_id, agent_progress FROM messages WHERE project_id = ? AND state = 'running'", item.id) ?? null;
     const records = store.all(`SELECT messages.id, prompt, model_id, model_name, state, response, created, result_type, agent_progress, agent_events,
-      message_reasoning.message_id IS NOT NULL AS has_reasoning FROM messages
+      message_reasoning.message_id IS NOT NULL AS has_reasoning,
+      EXISTS (SELECT 1 FROM generation_runs r JOIN generation_checkpoints c ON c.message_id = r.message_id
+        WHERE r.message_id = messages.id AND r.base_revision IS ? AND c.snapshot IS NOT NULL) AS has_checkpoint FROM messages
       LEFT JOIN message_reasoning ON message_reasoning.message_id = messages.id
-      WHERE project_id = ? ORDER BY created, messages.rowid`, item.id);
-    return { project: projectView(item), messages: records.map(({ agent_events, ...record }) => ({
+      WHERE project_id = ? AND chat_id IS ? ORDER BY created, messages.rowid`, item.active_revision, item.id, chat);
+    return { project: projectView(item), chats, activeGeneration, messages: records.map(({ agent_events, ...record }) => ({
       ...record, agent_events: agent_events ? JSON.parse(agent_events) : []
     })) };
+  });
+  route('POST', '/projects/:id/chats', async (request, reply) => {
+    const item = ownedProject(request);
+    const chat = { id: id(), title: '新对话' };
+    store.run('INSERT INTO project_chats (id, project_id, created) VALUES (?, ?, ?)', chat.id, item.id, Date.now());
+    return reply.code(201).send(chat);
   });
   route('GET', '/projects/:id/messages/:messageId/reasoning', async (request) => {
     const item = ownedProject(request);
@@ -238,7 +286,14 @@ export async function createApp(config) {
   route('DELETE', '/projects/:id', async (request) => {
     const item = ownedProject(request);
     const running = store.get("SELECT id FROM messages WHERE project_id = ? AND state = 'running'", item.id);
-    if (running) tasks.get(running.id)?.controller.abort();
+    const job = running && tasks.get(running.id);
+    job?.controller.abort();
+    await job?.task;
+    const draft = draftPreviews.get(item.id);
+    if (draft) {
+      draftPreviews.delete(item.id);
+      await preview.delete(draft.key, () => [{ id: draft.id }]);
+    }
     let shared;
     await preview.delete(item.id, () => {
       ownedProject(request);
@@ -256,13 +311,26 @@ export async function createApp(config) {
   });
   route('POST', '/projects/:id/generate', async (request, reply) => {
     const item = ownedProject(request);
-    const prompt = field(request.body?.prompt, '需求', 6000);
-    const modelId = field(request.body?.modelId ?? 'platform', '模型', 64);
+    const chat = projectChat(item.id, request.body?.chatId);
+    const resumeId = request.body?.resumeMessageId == null ? null : field(request.body.resumeMessageId, '生成记录', 64);
+    const resume = resumeId && store.get(`SELECT m.*, r.base_revision FROM messages m JOIN generation_runs r ON r.message_id = m.id
+      WHERE m.id = ? AND m.project_id = ? AND m.chat_id IS ? AND m.state IN ('failed', 'stopped')
+      AND EXISTS (SELECT 1 FROM generation_checkpoints c WHERE c.message_id = m.id AND c.snapshot IS NOT NULL)`, resumeId, item.id, chat);
+    if (resumeId && (!resume || resume.base_revision !== item.active_revision)) {
+      throw new PublicError(409, '当前版本没有可继续的检查点。');
+    }
+    const prompt = resume ? resume.prompt : field(request.body?.prompt, '需求', 6000);
+    const modelId = resume ? resume.model_id : field(request.body?.modelId ?? 'platform', '模型', 64);
     const model = modelConfig(modelId, item.user_id);
-    const messageId = id();
+    const messageId = resumeId ?? id();
     store.transaction(() => {
       if (store.get("SELECT id FROM messages WHERE project_id = ? AND state = 'running'", item.id)) throw new PublicError(409, '这个项目正在生成，请等待当前请求完成。');
       if (tasks.size >= (config.generationConcurrency ?? 4)) throw new PublicError(503, '生成任务较多，请稍后重试。');
+      if (resume) {
+        store.run("UPDATE messages SET state = 'running', response = NULL, agent_progress = ? WHERE id = ?", '正在从检查点继续…', messageId);
+        store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+        return;
+      }
       if (modelId === 'platform') {
         quota(item.user_id + ':platform', config.dailyUser ?? 5);
         quota('platform:all', config.dailyGlobal ?? 100);
@@ -270,32 +338,39 @@ export async function createApp(config) {
         quota(item.user_id + ':' + (modelId === 'demo' ? 'demo' : 'custom'), config.dailyCustom ?? 30);
       }
       const now = Date.now();
-      store.run('INSERT INTO messages (id, project_id, prompt, model_id, model_name, state, created) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        messageId, item.id, prompt, modelId, model.name, 'running', now);
+      store.run('INSERT INTO messages (id, project_id, chat_id, prompt, model_id, model_name, state, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        messageId, item.id, chat, prompt, modelId, model.name, 'running', now);
+      if (modelId !== 'demo') store.run('INSERT INTO generation_runs (message_id, base_revision) VALUES (?, ?)', messageId, item.active_revision);
+      if (chat) store.run('UPDATE project_chats SET title = ? WHERE id = ? AND title IS NULL',
+        [...prompt.replace(/\s+/gu, ' ')].slice(0, 32).join(''), chat);
       store.run('UPDATE projects SET updated = ? WHERE id = ?', now, item.id);
     });
     const controller = new AbortController();
     const { signal } = controller;
     const task = (async () => {
-      const events = [];
+      const events = JSON.parse(resume?.agent_events ?? '[]');
       const draftController = new AbortController();
       const draftSignal = AbortSignal.any([signal, draftController.signal]);
       let draft;
       let draftStart;
       async function discardDraft() {
         draftController.abort();
-        if (draftPreviews.get(item.id) === draft) draftPreviews.delete(item.id);
         await draftStart;
+        const active = draftPreviews.get(item.id);
+        if (active?.key === 'draft:' + messageId) {
+          draftPreviews.delete(item.id);
+          draft = active;
+        }
         if (draft) {
           await preview.delete(draft.key, () => [{ id: draft.id }]);
           draft = undefined;
         }
       }
       const reasoningLimit = 16000;
-      let reasoning = '';
-      let savedReasoning = '';
+      let reasoning = resume ? store.get('SELECT body FROM message_reasoning WHERE message_id = ?', messageId)?.body ?? '' : '';
+      let savedReasoning = reasoning;
       let lastReasoningWrite = 0;
-      let reasoningTruncated = false;
+      let reasoningTruncated = reasoning.length >= reasoningLimit;
       const flushReasoning = () => {
         const value = reasoningTruncated ? reasoning + '\n\n[其余思考内容已省略]' : reasoning;
         if (value === savedReasoning) return;
@@ -306,35 +381,28 @@ export async function createApp(config) {
       };
       try {
         const prior = item.active_revision ? revision(item) : undefined;
-        const teamRequired = modelId !== 'demo' && Boolean(store.get(`
-          SELECT 1 FROM messages
-          WHERE project_id = ? AND prompt = ? AND state IN ('failed', 'stopped')
-          AND EXISTS (
-            SELECT 1 FROM json_each(CASE WHEN json_valid(agent_events) THEN agent_events END) AS event
-            WHERE event.value ->> 'kind' = 'assign' AND event.value ->> 'role' IN ('frontend', 'backend')
-          )
-          LIMIT 1`, item.id, prompt));
+        const previousAttempt = resume ? { state: resume.state, response: resume.response } : modelId === 'demo' ? undefined : store.get(`
+          SELECT state, substr(response, 1, 1200) AS response FROM messages
+          WHERE project_id = ? AND chat_id IS ? AND prompt = ? AND state IN ('failed', 'stopped')
+          ORDER BY created DESC LIMIT 1`, item.id, chat, prompt);
         const memory = modelId === 'demo' ? undefined : await loadProjectMemory(store, item.id, model, completion, (error) => {
           app.log.warn({ project: item.id, name: error.name, code: error.code }, 'Could not update project memory');
-        }, signal);
+        }, signal, chat);
         signal.throwIfAborted();
         const output = await buildProject(model, prompt, prior ? JSON.parse(prior.files) : undefined,
           modelId === 'demo' ? demoCompletion : completion, {
-            memory, signal, teamRequired,
+            memory, signal, previousAttempt, projectState: prior ? { revision: prior.id, version: prior.version } : null,
+            checkpointer: modelId === 'demo' ? undefined : new GenerationCheckpointer(store, messageId),
+            threadId: messageId, resume: Boolean(resume),
             testBrowser,
             onCandidate(files) {
-              if (item.active_revision || draftStart || draftSignal.aborted) return;
-              const candidate = { id: id(), key: 'draft:' + messageId, files: JSON.stringify(files) };
-              const draftProject = { ...item, id: candidate.key, active_revision: candidate.id };
-              draftStart = preview.start(draftProject, () => ({
-                current: draftProject, revision: candidate,
-                initialize() {
-                  draftSignal.throwIfAborted();
-                  if (project(item.id, item.user_id).active_revision) throw new PublicError(409, '项目已经发布。');
-                  draft = candidate;
-                  draftPreviews.set(item.id, candidate);
-                }
-              }), draftSignal).catch((error) => {
+              if (draftSignal.aborted) return;
+              const candidate = { id: id(), message_id: messageId, files: JSON.stringify(files) };
+              store.run('UPDATE generation_runs SET draft_id = ?, draft_files = ? WHERE message_id = ? AND draft_files IS NOT ?',
+                candidate.id, candidate.files, messageId, candidate.files);
+              if (item.active_revision || draftStart || activeDraft(item)) return;
+              const saved = store.get('SELECT message_id, draft_id AS id, draft_files AS files FROM generation_runs WHERE message_id = ?', messageId);
+              draftStart = startDraft(item, saved, draftSignal).then((value) => { draft = value; }).catch((error) => {
                 if (!(error instanceof PublicError) && !draftSignal.aborted) app.log.warn({ name: error.name }, 'Could not start draft preview');
               }).finally(() => { if (!draft) draftStart = undefined; });
             },
@@ -346,7 +414,7 @@ export async function createApp(config) {
               store.run("UPDATE messages SET agent_progress = ? WHERE id = ? AND state = 'running'", stage || null, messageId);
             },
             onAgentEvent(event) {
-              if (signal.aborted || events.length >= 256) return;
+              if (signal.aborted || events.length >= 1024) return;
               events.push(event);
               store.run("UPDATE messages SET agent_events = ? WHERE id = ? AND state = 'running'", JSON.stringify(events), messageId);
             },
@@ -363,7 +431,10 @@ export async function createApp(config) {
         await discardDraft();
         signal.throwIfAborted();
         if (!output.files) {
-          store.run("UPDATE messages SET state = 'complete', result_type = 'answer', response = ? WHERE id = ?", output.summary, messageId);
+          store.transaction(() => {
+            store.run("UPDATE messages SET state = 'complete', result_type = 'answer', response = ?, agent_progress = NULL WHERE id = ?", output.summary, messageId);
+            store.run('DELETE FROM generation_runs WHERE message_id = ?', messageId);
+          });
           return;
         }
         const active = project(item.id, item.user_id);
@@ -376,16 +447,18 @@ export async function createApp(config) {
           }
           store.run('INSERT INTO revisions VALUES (?, ?, ?, ?)', next, item.id, (prior?.version ?? 0) + 1, JSON.stringify(output.files));
           store.run('UPDATE projects SET active_revision = ?, updated = ? WHERE id = ?', next, Date.now(), item.id);
-          store.run("UPDATE messages SET state = 'complete', result_type = 'revision', response = ? WHERE id = ?", output.summary, messageId);
+          store.run("UPDATE messages SET state = 'complete', result_type = 'revision', response = ?, agent_progress = NULL WHERE id = ?", output.summary, messageId);
+          store.run('DELETE FROM generation_runs WHERE message_id = ?', messageId);
         }), signal);
       } catch (error) {
         flushReasoning();
         if (signal.aborted) {
-          store.run("UPDATE messages SET state = 'stopped', agent_progress = NULL, response = ? WHERE id = ?", '已停止生成。', messageId);
+          store.run("UPDATE messages SET state = ?, agent_progress = NULL, response = ? WHERE id = ?",
+            closing ? 'failed' : 'stopped', closing ? '平台重启中断了生成，请从检查点继续。' : '已停止生成。', messageId);
           return;
         }
         if (!(error instanceof PublicError)) app.log.error({ project: item.id, code: error.code, name: error.name }, 'Generation failed');
-        store.run("UPDATE messages SET state = 'failed', response = ? WHERE id = ?", error instanceof PublicError ? error.message : '生成失败，请稍后重试。', messageId);
+        store.run("UPDATE messages SET state = 'failed', response = ?, agent_progress = NULL WHERE id = ?", error instanceof PublicError ? error.message : '生成失败，请稍后重试。', messageId);
       } finally {
         await discardDraft();
       }
@@ -407,6 +480,19 @@ export async function createApp(config) {
   });
   route('POST', '/projects/:id/preview/start', async (request) => {
     const item = ownedProject(request);
+    if (request.body?.draft === true || !item.active_revision) {
+      const saved = savedDraft(item);
+      if (!saved) throw new PublicError(409, '没有可查看的候选预览。');
+      const { files } = store.get('SELECT draft_files AS files FROM generation_runs WHERE message_id = ?', saved.message_id);
+      if (item.active_revision) await preview.stop(item.id);
+      await startDraft(item, { ...saved, files });
+      return projectView(ownedProject(request));
+    }
+    const draft = activeDraft(item);
+    if (draft) {
+      await preview.delete(draft.key, () => [{ id: draft.id }]);
+      draftPreviews.delete(item.id);
+    }
     await preview.start(item, () => {
       const current = ownedProject(request);
       return { current, revision: revision(current) };
@@ -415,7 +501,10 @@ export async function createApp(config) {
   });
   route('POST', '/projects/:id/preview/stop', async (request) => {
     const item = ownedProject(request);
-    await preview.stop(item.id);
+    const draft = activeDraft(item);
+    if (draft) await preview.delete(draft.key, () => [{ id: draft.id }]);
+    else await preview.stop(item.id);
+    if (draft && draftPreviews.get(item.id) === draft) draftPreviews.delete(item.id);
     return projectView(ownedProject(request));
   });
   route('GET', '/projects/:id/preview', async (request) => {
@@ -556,8 +645,10 @@ export async function createApp(config) {
     });
   }
   app.addHook('onClose', async () => {
+    closing = true;
     clearInterval(throttle);
     clearInterval(expiryTimer);
+    for (const { controller } of tasks.values()) controller.abort();
     await Promise.allSettled([...tasks.values()].map(({ task }) => task));
     await Promise.all([preview.close(), sharedPreview.close()]);
     store.db.close();

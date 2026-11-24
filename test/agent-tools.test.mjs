@@ -147,11 +147,11 @@ test('browser actions validate and normalize all supported operation arguments',
     { action: 'assert_count', selector: '.card', minCount: 1 }
   ];
   assert.deepEqual(JSON.parse(JSON.stringify(previewActions(valid))), valid);
-  assert.equal(previewActions(Array(10).fill(valid[0])).length, 10);
+  assert.equal(previewActions(Array(20).fill(valid[0])).length, 20);
   const longest = { action: 'assert_text', selector: 'x'.repeat(240), value: 'x'.repeat(300) };
   assert.equal(previewActionError([longest, { ...valid[7], minCount: 500 }]), null);
   for (const [name, input, expected] of [
-    ['not an array', {}, /步骤数组/], ['empty', [], /步骤数量/], ['11 steps', Array(11).fill(valid[0]), /步骤数量/],
+    ['not an array', {}, /步骤数组/], ['empty', [], /步骤数量/], ['21 steps', Array(21).fill(valid[0]), /步骤数量/],
     ['null step', [null], /必须是包含 action 的对象/], ['unknown action', [{ action: 'wait' }], /wait/],
     ['click without selector', [{ action: 'click' }], /selector/],
     ['invalid selector length', [{ ...longest, selector: 'x'.repeat(241) }], /selector/],

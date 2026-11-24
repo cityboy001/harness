@@ -6,10 +6,10 @@ import type { AgentEvent, AgentRole, AgentState, Conversation } from './api';
 const props = defineProps<{ events: AgentEvent[]; state: Conversation['state'] }>();
 const roles: Record<AgentRole, string> = {
   central: '中央 Agent', frontend: '前端 Agent', backend: '后端 Agent', browser: '浏览器验收',
-  direct: '单 Agent', analyze: '分析任务', read_project: '项目调查'
+  direct: '单 Agent', analyze: '分析任务', read_project: '项目调查', edit_project: '项目修改'
 };
-const states: Record<AgentState | 'stopped', string> = {
-  waiting: '待执行', running: '进行中', done: '已完成', failed: '失败', stopped: '已停止'
+const states: Record<AgentState | 'stopped' | 'skipped', string> = {
+  waiting: '待执行', running: '进行中', done: '已完成', failed: '失败', stopped: '已停止', skipped: '未执行'
 };
 const actions: Record<string, string> = { inspect: '检查页面', click: '点击', fill: '填写', press: '按键', scroll: '滚动', scroll_until: '滚动直到目标出现', assert_text: '检查可见文本', assert_count: '检查可见元素数量' };
 const jobs = computed(() => {
@@ -19,7 +19,7 @@ const jobs = computed(() => {
     const previous = active.get(key);
     const title = (event.kind === 'check' ? undefined : event.title) ?? previous?.title ?? roles[event.role];
     if (event.kind === 'assign') active.set(key, {
-      key, title, state: 'waiting', task: previous?.task ?? event.task, dependsOn: previous?.dependsOn ?? event.dependsOn
+      key, title, state: 'waiting', task: event.task, dependsOn: event.dependsOn
     });
     else active.set(key, {
       ...previous, key, title, state: event.state, detail: event.kind === 'status' ? event.detail : undefined
@@ -27,8 +27,8 @@ const jobs = computed(() => {
   }
   return [...active.values()].map((job) => ({
     ...job, dependencyTitles: job.dependsOn?.map((id) => active.get('task:' + id)?.title ?? id).join('、'),
-    state: props.state !== 'running' && (job.state === 'waiting' || job.state === 'running')
-      ? 'stopped' as const : job.state
+    state: props.state !== 'running' && job.state === 'waiting' ? 'skipped' as const
+      : props.state !== 'running' && job.state === 'running' ? 'stopped' as const : job.state
   }));
 });
 const tasks = computed(() => jobs.value.filter((job) => job.task !== undefined));

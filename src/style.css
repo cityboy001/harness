@@ -96,6 +96,8 @@ p { line-height: 1.6; }
 .conversation, .result { min-width: 0; display: flex; flex-direction: column; }
 .conversation { border-right: 1px solid var(--line); }
 .pane-head { display: flex; min-height: 57px; padding: 8px clamp(12px, 2vw, 22px); align-items: center; justify-content: space-between; gap: 6px; border-bottom: 1px solid var(--line); }
+.chat-head > strong, .chat-head > button { flex-shrink: 0; white-space: nowrap; }
+.chat-head > select { flex: 1; min-width: 0; max-width: 220px; margin-left: auto; text-overflow: ellipsis; }
 .result-head, .tabs, .preview-actions, .source-label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .source-label { font-size: .86rem; color: var(--muted); }
 .thread { flex: 1 1 auto; padding: clamp(12px, 2vw, 24px); display: grid; gap: 20px; align-content: start; max-height: calc(100dvh - 312px); min-height: 270px; overflow: auto; }
