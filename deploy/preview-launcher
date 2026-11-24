@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+[ "${SUDO_USER:-}" = ai-site-builder ]
+[ "$#" -eq 1 ]
+revision="$1"
+case "$revision" in
+  *[!a-f0-9]*|'') exit 2 ;;
+esac
+[ "${#revision}" -eq 32 ]
+
+root=/var/lib/ai-site-builder/previews
+state="$root/$revision"
+[ "$(/usr/bin/realpath -e -- "$state")" = "$state" ]
+uid=$(/usr/bin/id -u ai-site-builder)
+gid=$(/usr/bin/id -g ai-site-builder)
+[ "$(/usr/bin/stat -c %u -- "$state")" = "$uid" ]
+
+exec /usr/bin/docker --host unix:///var/run/docker.sock run --rm -i --pull=never \
+  --label com.ai-site-builder.preview=1 --runtime=runsc --network=none --ipc=none \
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --memory=192m --memory-swap=192m --cpus=0.5 --pids-limit=48 --ulimit nofile=128:128 \
+  --user "$uid:$gid" --log-driver=none --mount "type=bind,src=$state,dst=/state" \
+  ai-site-builder-preview:1

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+[ "${SUDO_USER:-}" = ai-site-builder ]
+[ "$#" -eq 0 ]
+
+exec /usr/bin/timeout --kill-after=3 34 /usr/bin/docker --host unix:///var/run/docker.sock run \
+  --rm -i --init --pull=never --label com.ai-site-builder.preview=1 \
+  --runtime=runsc --network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --user pwuser --env HOME=/tmp --tmpfs /tmp:rw,nosuid,nodev,size=128m,mode=1777 \
+  --memory=512m --memory-swap=512m --cpus=1 --pids-limit=128 --log-driver=none \
+  ai-site-builder-browser:1

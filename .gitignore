@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.env
+.builder-data/
+服务器登录.txt

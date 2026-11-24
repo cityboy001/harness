@@ -1,0 +1,23 @@
+[Unit]
+Description=AI Site Builder
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+User=ai-site-builder
+Group=ai-site-builder
+WorkingDirectory=/srv/ai-site-builder
+EnvironmentFile=/etc/ai-site-builder/app.env
+ExecStartPre=+/bin/sh -c '/usr/bin/docker ps -aq --filter label=com.ai-site-builder.preview=1 | /usr/bin/xargs -r /usr/bin/docker rm -f'
+ExecStart=/usr/local/lib/ai-site-builder/node /srv/ai-site-builder/server/index.mjs
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=25
+UMask=0077
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ai-site-builder
+
+[Install]
+WantedBy=multi-user.target

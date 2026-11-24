@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5eee1">
+  <title>鹈鹕骑行记</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100svh;
+      display: grid;
+      place-items: center;
+      padding: 32px 20px;
+      background: #f5eee1;
+      color: #203a39;
+      font: 16px/1.5 system-ui, "Microsoft YaHei", sans-serif;
+    }
+    main { width: min(100%, 1024px); }
+    header, .controls { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    header { margin-bottom: 16px; border-top: 2px solid #203a39; padding-top: 12px; }
+    h1 { margin: 0; font: 800 clamp(24px, 5vw, 44px)/1.2 "Songti SC", SimSun, serif; }
+    .location { margin: 0; font-size: 13px; letter-spacing: .15em; white-space: nowrap; }
+    .picture { overflow: hidden; border: 1px solid #203a39; border-radius: 12px; background: #bad8cf; }
+    canvas { display: block; width: 100%; height: auto; }
+    .controls { margin-top: 14px; flex-wrap: wrap; }
+    button, select {
+      min-height: 42px;
+      border: 1px solid #203a39;
+      border-radius: 6px;
+      padding: 6px 14px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button { background: #203a39; color: #fff8e9; }
+    button:hover { background: #315755; }
+    select { background: #fff8e9; color: inherit; margin-left: 8px; }
+    :focus-visible { outline: 3px solid #ae442f; outline-offset: 3px; }
+    @media (max-width: 480px) {
+      body { padding: 20px 12px; }
+      .location { font-size: 11px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>鹈鹕骑行记</h1>
+      <p class="location">海岸公路</p>
+    </header>
+    <div class="picture">
+      <canvas id="ride" width="960" height="540" role="img" aria-label="一只长橙嘴的白鹈鹕骑着红色自行车沿海前行">
+        你的浏览器不支持 Canvas 动画。
+      </canvas>
+    </div>
+    <div class="controls">
+      <button id="toggle" type="button">暂停</button>
+      <label for="speed">速度<select id="speed">
+        <option value="0.5">0.5 倍</option>
+        <option value="1" selected>1 倍</option>
+        <option value="1.5">1.5 倍</option>
+        <option value="2">2 倍</option>
+      </select></label>
+    </div>
+  </main>
+  <script>
+    const canvas = document.querySelector('#ride');
+    const ctx = canvas.getContext('2d');
+    const toggle = document.querySelector('#toggle');
+    const speed = document.querySelector('#speed');
+    const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+    const ink = '#223c3d';
+    const ivory = '#fff4db';
+    const coral = '#da624d';
+    const tau = Math.PI * 2;
+    const rear = [344, 379];
+    const front = [631, 379];
+    const crank = [471, 379];
+    const wheelRadius = 65;
+    let time = 0;
+    let previousFrame = null;
+    let frameId = null;
+    let playing = !reducedMotion.matches;
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    function shape(outline, fill, stroke, width = 2) {
+      const path = new Path2D(outline);
+      if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fill(path);
+      }
+      if (stroke) {
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = width;
+        ctx.stroke(path);
+      }
+    }
+
+    function line(points, color, width) {
+      ctx.beginPath();
+      ctx.moveTo(...points[0]);
+      for (const point of points.slice(1)) ctx.lineTo(...point);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.stroke();
+    }
+
+    function oval(x, y, rx, ry, color, stroke, width = 2) {
+      ctx.beginPath();
+      ctx.ellipse(x, y, rx, ry, 0, 0, tau);
+      if (color) {
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+      if (stroke) {
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = width;
+        ctx.stroke();
+      }
+    }
+
+    function repeat(spacing, offset, draw) {
+      const start = -((offset % spacing + spacing) % spacing) - spacing;
+      for (let x = start, i = 0; x < 960 + spacing; x += spacing, i++) draw(x, i);
+    }
+
+    function cloud(x, y, scale) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(scale, scale);
+      shape('M-77 7 Q-70 -5 -43 -6 Q-36 -27 -13 -24 Q4 -26 20 -11 Q51 -16 74 7 Q12 12 -77 7Z', '#f9ebce');
+      ctx.restore();
+    }
+
+    const grain = document.createElement('canvas');
+    grain.width = 960;
+    grain.height = 540;
+    const grainContext = grain.getContext('2d');
+    let seed = 74;
+    function random() {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 4294967296;
+    }
+    for (let i = 0; i < 25000; i++) {
+      grainContext.fillStyle = i % 2 ? '#203a3912' : '#fff8e52a';
+      grainContext.fillRect(random() * 960, random() * 540, 1 + random(), 1);
+    }
+
+    function landscape(distance) {
+      const sky = ctx.createLinearGradient(0, 0, 0, 340);
+      sky.addColorStop(0, '#a8cfc9');
+      sky.addColorStop(1, '#e8e5c8');
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, 960, 540);
+      oval(777, 104, 43, 43, '#f9dc9b');
+
+      repeat(317, distance * 0.045 - 90, (x) => {
+        cloud(x, 97, 1.15);
+        cloud(x + 132, 158, .58);
+      });
+
+      repeat(420, distance * 0.11, (x) => {
+        ctx.save();
+        ctx.translate(x, 0);
+        shape('M0 290 Q46 265 83 271 Q123 239 179 265 Q224 218 305 250 Q355 248 420 290Z', '#9fbab0');
+        shape('M0 299 Q52 269 115 285 Q153 266 200 281 Q245 250 313 277 Q375 275 420 299Z', '#719e98');
+        ctx.restore();
+      });
+
+      ctx.fillStyle = '#77aaa4';
+      ctx.fillRect(0, 295, 960, 99);
+      for (let row = 0; row < 4; row++) {
+        repeat(120, distance * (0.21 + row * 0.045) + row * 63, (x) => {
+          const y = 308 + row * 19;
+          shape(`M${x} ${y} q20 -4 41 0 m10 0 h13`, null, row % 2 ? '#a6c8b5' : '#c4d6bb', 2);
+        });
+      }
+      shape('M0 367 Q152 362 283 374 T590 369 T960 366 V432 H0Z', '#c3b888');
+      ctx.fillStyle = '#e2b789';
+      ctx.fillRect(0, 403, 960, 137);
+      line([[0, 410], [960, 410]], '#f5d4a3', 4);
+      line([[0, 483], [960, 483]], '#f5d4a3', 3);
+      ctx.fillStyle = '#a4a775';
+      ctx.fillRect(0, 489, 960, 51);
+
+      repeat(135, distance, (x) => {
+        line([[x, 459], [x + 41, 459]], '#f4d5ac', 3);
+        oval(x + 49, 477, 4, 1.1, '#bc9874');
+        oval(x + 56, 427, 2, 1, '#bc9874');
+      });
+      repeat(238, distance * 1.08, (x) => {
+        shape(`M${x} 396 q-7 -18 -15 -24 m15 24 q1 -21 10 -30 m-10 30 q14 -15 24 -14`, null, '#6b855f', 2.5);
+        oval(x + 61, 391, 12, 3, '#9e9a77');
+        shape(`M${x + 96} 516 q-7 -17 -17 -21 m17 21 q0 -22 9 -30 m-9 30 q12 -14 22 -13`, null, '#637e5b', 3);
+        oval(x + 152, 529, 11, 3.5, '#848d69');
+      });
+    }
+
+    function wheel([x, y], angle) {
+      oval(x, y, wheelRadius, wheelRadius, '#f8e7c624', ink, 9);
+      oval(x, y, 59, 59, null, '#fff1d3', 3);
+      for (let i = 0; i < 12; i++) {
+        const spoke = angle + i * tau / 12;
+        line([[x, y], [x + Math.cos(spoke) * 57, y + Math.sin(spoke) * 57]], '#586966', 1.5);
+      }
+      oval(x, y, 7, 7, '#e3bc82', ink, 2.5);
+    }
+
+    function tube(points) {
+      line(points, ink, 13);
+      line(points, coral, 8);
+    }
+
+    function pedal(angle) {
+      return [crank[0] + 22 * Math.cos(angle), crank[1] + 22 * Math.sin(angle)];
+    }
+
+    function leg(foot, hip, color, toe) {
+      const knee = [hip[0] + 27 + (foot[0] - crank[0]) * .6, (hip[1] + foot[1]) / 2 - 13];
+      const points = [hip, knee, [foot[0] - 4, foot[1] - 5]];
+      line(points, ink, 11);
+      line(points, color, 7);
+      oval(foot[0] + 3, foot[1] - 4, 13, 5, toe, ink, 2);
+    }
+
+    function bird(bob) {
+      ctx.save();
+      ctx.translate(0, bob);
+      shape('M411 206 Q452 196 468 170 Q485 148 498 128 Q511 109 533 114 Q561 115 567 143 Q576 165 554 181 Q529 198 513 222 Q493 254 470 269 Q435 289 390 272 Q360 260 334 237 Q361 239 375 221 Q390 210 411 206Z', ivory, ink, 3.5);
+      shape('M348 245 Q379 252 408 255 Q468 270 497 232 Q480 265 457 273 Q409 290 371 264Z', '#e2d9bf');
+      shape('M540 156 Q574 153 600 161 L680 169 Q657 184 621 199 Q594 212 569 193 Q553 184 540 156Z', '#edaa57', ink, 3);
+      shape('M539 145 Q549 134 567 139 L674 156 Q687 159 680 169 Q636 168 590 166 Q564 166 547 159Z', '#ef924c', ink, 3);
+      shape('M555 145 Q610 150 660 158', null, '#ffca7c', 2);
+      shape('M529 115 Q514 105 501 110 M520 119 Q504 114 494 121', null, ink, 2.5);
+      oval(545, 135, 7, 7, ink);
+      oval(547, 133, 2, 2, ivory);
+      oval(565, 150, 3, 1.7, '#9b573b');
+      ctx.restore();
+
+      // The wing tips stay on the handlebar as the bird bobs.
+      shape(`M414 ${220 + bob} Q436 ${201 + bob} 479 ${215 + bob} Q525 223 565 243 Q579 250 585 245 Q592 246 589 253 Q583 262 565 259 Q528 256 505 253 Q459 275 424 249 Q404 235 414 ${220 + bob}Z`, '#f6e9cf', ink, 3);
+      shape('M432 232 Q458 248 488 243 M441 242 Q463 254 482 251', null, '#b5ad98', 2);
+      shape('M558 247 q16 8 27 3 q-4 10 -21 7Z', '#52605a');
+    }
+
+    function bicycle(distance) {
+      const angle = time * tau * .86;
+      const bob = Math.sin(angle * 2) * 2.4;
+      const away = pedal(angle + Math.PI);
+      const near = pedal(angle);
+      oval(488, 449, 202, 11, '#80685336');
+      wheel(rear, distance / wheelRadius);
+      wheel(front, distance / wheelRadius);
+      line([[344, 371], [470, 362]], '#526762', 3);
+      line([[344, 387], [470, 396]], '#526762', 3);
+      line([[418, 268], [432, 300]], ink, 8);
+      tube([rear, [429, 291], crank, rear]);
+      tube([[429, 291], [570, 301], crank]);
+      tube([[565, 286], [579, 326], front]);
+      shape('M563 298 Q555 270 566 258 L583 252', null, ink, 7);
+      line([[572, 252], [591, 252]], ink, 9);
+      shape('M398 268 Q415 263 445 269 Q451 272 445 275 L421 277 Q405 277 398 273Z', ink);
+      oval(...crank, 19, 19, '#edc188', ink, 3);
+      oval(...crank, 8, 8, '#516862', ink);
+      line([crank, away], '#6c7666', 5);
+      line([[away[0] - 9, away[1]], [away[0] + 11, away[1]]], '#52625d', 4);
+      leg(away, [431, 263 + bob], '#bd744f', '#cd8655');
+      line([crank, near], ink, 6);
+      line([[near[0] - 9, near[1]], [near[0] + 11, near[1]]], ink, 5);
+      leg(near, [444, 260 + bob], '#e89a58', '#f5b467');
+      bird(bob);
+    }
+
+    function render() {
+      const distance = time * 141;
+      landscape(distance);
+      bicycle(distance);
+      ctx.drawImage(grain, 0, 0);
+    }
+
+    function animate(timestamp) {
+      if (previousFrame !== null) {
+        time += Math.min((timestamp - previousFrame) / 1000, 0.05) * Number(speed.value);
+      }
+      previousFrame = timestamp;
+      render();
+      frameId = requestAnimationFrame(animate);
+    }
+
+    function updatePlayback() {
+      toggle.textContent = playing ? '暂停' : '播放';
+      if (frameId !== null) cancelAnimationFrame(frameId);
+      frameId = null;
+      previousFrame = null;
+      if (playing) frameId = requestAnimationFrame(animate);
+    }
+
+    toggle.addEventListener('click', () => {
+      playing = !playing;
+      updatePlayback();
+    });
+    reducedMotion.addEventListener('change', (event) => {
+      playing = !event.matches;
+      updatePlayback();
+    });
+    render();
+    updatePlayback();
+  </script>
+</body>
+</html>

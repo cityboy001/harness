@@ -1,0 +1,9 @@
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS node24
+FROM mcr.microsoft.com/playwright:v1.58.2-noble@sha256:6446946a1d9fd62d9ae501312a2d76a43ee688542b21622056a372959b65d63d
+COPY --from=node24 /usr/local/bin/node /usr/local/bin/node
+WORKDIR /runner
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+COPY server/browser-runner.mjs server/guest.mjs server/preview.mjs server/preview-requests.mjs server/models.mjs ./server/
+COPY src/preview-document.js ./src/
+ENTRYPOINT ["node", "/runner/server/browser-runner.mjs"]

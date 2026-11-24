@@ -1,0 +1,14 @@
+*
+!package.json
+!package-lock.json
+!server
+!server/guest.mjs
+!server/browser-runner.mjs
+!server/models.mjs
+!server/preview.mjs
+!server/preview-requests.mjs
+!src
+!src/preview-document.js
+!deploy
+!deploy/Dockerfile.preview
+!deploy/Dockerfile.browser

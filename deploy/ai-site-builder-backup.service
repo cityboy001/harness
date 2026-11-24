@@ -1,0 +1,7 @@
+[Unit]
+Description=SQLite backup for AI Site Builder
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/local/lib/ai-site-builder/node /srv/ai-site-builder/deploy/backup.mjs
