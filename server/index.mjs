@@ -27,7 +27,7 @@ const app = await createApp({
   browserLauncher: env.BROWSER_TEST_LAUNCHER,
   demo: env.BUILDER_DEMO === '1',
   maxTokens: number('MODEL_MAX_TOKENS', 10000),
-  deepseekMaxTokens: number('DEEPSEEK_MAX_TOKENS', 32000),
+  deepseekMaxTokens: number('DEEPSEEK_MAX_TOKENS', 64000),
   dailyUser: number('PLATFORM_USER_DAILY_LIMIT', 5, 0),
   dailyGlobal: number('PLATFORM_DAILY_LIMIT', 100, 0),
   dailyCustom: number('CUSTOM_USER_DAILY_LIMIT', 30, 0),

@@ -6,7 +6,7 @@ import { chromium } from 'playwright-core';
 import { createPreviewDocument, previewSandbox, previewStorageUpdate } from '../src/preview-document.js';
 import { Guest } from './preview.mjs';
 import { previewInput } from './preview-requests.mjs';
-import { compareLayout, maxAcceptanceActions, previewActions, relativeLayout } from './generation-browser.mjs';
+import { compareLayout, maxAcceptanceActions, normalizeBrowserContext, previewActions, previewTestActions, relativeLayout } from './generation-browser.mjs';
 
 const fixtureUrl = 'https://builder-preview.test/';
 const actionTimeout = 2200;
@@ -15,8 +15,8 @@ const maxApiEntries = 12;
 const maxInspectSamples = 4;
 
 // This function is installed in the trusted parent page, never in the generated document.
-function mountFixture({ files, sandbox, srcdoc }) {
-  let currentPage = 'index.html';
+function mountFixture({ files, sandbox, srcdoc, initialPage }) {
+  let currentPage = initialPage;
   let currentSearch = '';
   const storage = Object.create(null);
   let activePort;
@@ -111,17 +111,27 @@ async function measureLayout(frame, step) {
     const other = reference ? unique(container, reference, '参考元素') : null;
     if (target === other) throw new Error('目标与参考元素必须不同。');
     const read = () => [rect(container, '组件容器'), rect(target, '目标'), other ? rect(other, '参考元素') : null];
-    let previous = read();
-    let stable = false;
-    for (let sample = 0; sample < 12; sample++) {
+    const deadline = performance.now() + 1800;
+    let previous;
+    let stable;
+    let visibilityError;
+    while (performance.now() < deadline) {
       await nextFrame();
-      const current = read();
-      stable = JSON.stringify(current) === JSON.stringify(previous);
-      previous = current;
-      if (stable) break;
+      try {
+        const current = read();
+        if (previous && JSON.stringify(current) === JSON.stringify(previous)) {
+          stable = current;
+          break;
+        }
+        previous = current;
+        visibilityError = undefined;
+      } catch (error) {
+        visibilityError = error;
+        previous = undefined;
+      }
     }
-    if (!stable) throw new Error('元素边界仍在变化，无法取得稳定的布局测量。');
-    const [boundary, subject, referenceRect] = previous;
+    if (!stable) throw visibilityError ?? new Error('元素边界仍在变化，无法取得稳定的布局测量。');
+    const [boundary, subject, referenceRect] = stable;
     const anchor = referenceRect ?? boundary;
     const values = {
       leftInset: subject.left - boundary.left, rightInset: boundary.right - subject.right,
@@ -209,9 +219,12 @@ async function performAction(frame, step) {
   return {};
 }
 
-export async function browserTest({ files, actions }, { executablePath } = {}) {
+export async function browserTest({ files, actions, page: initialPage, viewport }, { executablePath } = {}) {
   actions = previewActions(actions, maxAcceptanceActions);
   if (!actions) return { status: 'failed', error: '浏览器步骤不符合协议。', steps: [] };
+  const launch = normalizeBrowserContext({ page: initialPage, viewport }, files);
+  if (launch.error) return { status: 'failed', error: launch.error, steps: [] };
+  actions = previewTestActions(actions);
   const directory = await mkdtemp(join(tmpdir(), 'builder-browser-'));
   const guest = new Guest(directory);
   let browser;
@@ -230,7 +243,7 @@ export async function browserTest({ files, actions }, { executablePath } = {}) {
       process.stderr.write(String(error.message).slice(0, 1000) + '\n');
       return { status: 'unavailable', error: 'Isolated Chromium could not start.', steps };
     }
-    const context = await browser.newContext({ viewport: { width: 1050, height: 730 } });
+    const context = await browser.newContext({ viewport: launch.viewport });
     await context.route('**/*', (route) => route.request().url() === fixtureUrl
       ? route.fulfill({ contentType: 'text/html; charset=utf-8',
           body: '<!doctype html><html><head><style>body{margin:0}iframe{width:100vw;height:100vh;border:0}</style></head><body></body></html>' })
@@ -266,7 +279,7 @@ export async function browserTest({ files, actions }, { executablePath } = {}) {
     await page.goto(fixtureUrl, { timeout: 3500 });
     const browserFiles = { ...files };
     delete browserFiles['server.js'];
-    await page.evaluate(mountFixture, { files: browserFiles, sandbox: previewSandbox, srcdoc: createPreviewDocument() });
+    await page.evaluate(mountFixture, { files: browserFiles, sandbox: previewSandbox, srcdoc: createPreviewDocument(), initialPage: launch.page });
     const frame = page.frameLocator('#preview');
     await frame.locator('html[data-builder-preview-ready]').waitFor({ state: 'attached', timeout: 3500 });
     for (const step of actions) {

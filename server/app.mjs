@@ -147,6 +147,38 @@ export async function createApp(config) {
       WHERE messages.project_id = ? AND generation_runs.base_revision IS ? AND draft_id IS NOT NULL
       ORDER BY messages.created DESC, messages.rowid DESC LIMIT 1`, item.id, item.active_revision);
   }
+  async function openProjectPreview(item, useDraft, signal) {
+    signal?.throwIfAborted();
+    if (useDraft || !item.active_revision) {
+      const saved = savedDraft(item);
+      if (!saved) throw new PublicError(409, '没有可查看的候选预览。');
+      const { files } = store.get('SELECT draft_files AS files FROM generation_runs WHERE message_id = ?', saved.message_id);
+      if (item.active_revision) await preview.stop(item.id);
+      signal?.throwIfAborted();
+      await startDraft(item, { ...saved, files }, signal);
+    } else {
+      const draft = activeDraft(item);
+      if (draft) {
+        await preview.delete(draft.key, () => [{ id: draft.id }]);
+        if (draftPreviews.get(item.id) === draft) draftPreviews.delete(item.id);
+      }
+      await preview.start(item, () => {
+        signal?.throwIfAborted();
+        const current = project(item.id, item.user_id);
+        return { current, revision: revision(current) };
+      }, signal);
+    }
+    return projectView(project(item.id, item.user_id));
+  }
+
+  async function closeProjectPreview(item) {
+    const draft = activeDraft(item);
+    if (draft) await preview.delete(draft.key, () => [{ id: draft.id }]);
+    else await preview.stop(item.id);
+    if (draft && draftPreviews.get(item.id) === draft) draftPreviews.delete(item.id);
+    return projectView(project(item.id, item.user_id));
+  }
+
   async function startDraft(item, saved, signal) {
     const key = 'draft:' + saved.message_id;
     const draft = { id: saved.id, key, files: saved.files, baseRevision: item.active_revision };
@@ -353,6 +385,7 @@ export async function createApp(config) {
       const draftSignal = AbortSignal.any([signal, draftController.signal]);
       let draft;
       let draftStart;
+      let previewClosed = false;
       async function discardDraft() {
         draftController.abort();
         await draftStart;
@@ -400,19 +433,30 @@ export async function createApp(config) {
             memory, signal, react: true, runCode: makeCodeRunner(config.codeLauncher),
             testBrowser, requireBrowser: Boolean(testBrowser) && modelId !== 'demo',
             resumeDraft: Boolean(draftFiles), comparisonFiles: baseline ?? null,
+            async controlPreview(action, useDraft, toolSignal) {
+              await draftStart;
+              toolSignal.throwIfAborted();
+              const current = project(item.id, item.user_id);
+              const view = action === 'open'
+                ? await openProjectPreview(current, useDraft, toolSignal)
+                : await closeProjectPreview(current);
+              previewClosed = action === 'close';
+              return { status: view.draftRevision ? 'running' : view.preview,
+                version: view.draftRevision ? 'draft' : view.revision ? 'published' : null };
+            },
             onCandidate(files) {
               if (draftSignal.aborted) return;
               const candidate = { id: id(), message_id: messageId, files: JSON.stringify(files) };
               store.run('UPDATE generation_runs SET draft_id = ?, draft_files = ? WHERE message_id = ? AND draft_files IS NOT ?',
                 candidate.id, candidate.files, messageId, candidate.files);
-              if (item.active_revision || draftStart || activeDraft(item)) return;
+              if (previewClosed || item.active_revision || draftStart || activeDraft(item)) return;
               const saved = store.get('SELECT message_id, draft_id AS id, draft_files AS files FROM generation_runs WHERE message_id = ?', messageId);
               draftStart = startDraft(item, saved, draftSignal).then((value) => { draft = value; }).catch((error) => {
                 if (!(error instanceof PublicError) && !draftSignal.aborted) app.log.warn({ name: error.name }, 'Could not start draft preview');
               }).finally(() => { if (!draft) draftStart = undefined; });
             },
             maxTokens: isDeepSeek(model)
-              ? (config.deepseekMaxTokens ?? 32000)
+              ? (config.deepseekMaxTokens ?? 64000)
               : (config.maxTokens ?? 10000),
             onProgress(stage) {
               if (signal.aborted) return;
@@ -436,6 +480,8 @@ export async function createApp(config) {
         await discardDraft();
         signal.throwIfAborted();
         if (!output.files) {
+          const saved = store.get('SELECT draft_id FROM generation_runs WHERE message_id = ?', messageId);
+          if (saved?.draft_id) throw new PublicError(422, '本轮未提交已验证的版本，已保留候选。\n\n' + output.summary);
           store.transaction(() => {
             store.run("UPDATE messages SET state = 'complete', result_type = 'answer', response = ?, agent_progress = NULL WHERE id = ?", output.summary, messageId);
             store.run('DELETE FROM generation_runs WHERE message_id = ?', messageId);
@@ -454,7 +500,7 @@ export async function createApp(config) {
           store.run('UPDATE projects SET active_revision = ?, updated = ? WHERE id = ?', next, Date.now(), item.id);
           store.run("UPDATE messages SET state = 'complete', result_type = 'revision', response = ?, agent_progress = NULL WHERE id = ?", output.summary, messageId);
           store.run('DELETE FROM generation_runs WHERE message_id = ?', messageId);
-        }), signal);
+        }), signal, !previewClosed);
       } catch (error) {
         flushReasoning();
         if (signal.aborted) {
@@ -483,35 +529,10 @@ export async function createApp(config) {
     job.controller.abort();
     return reply.code(202).send({ state: 'running' });
   });
-  route('POST', '/projects/:id/preview/start', async (request) => {
-    const item = ownedProject(request);
-    if (request.body?.draft === true || !item.active_revision) {
-      const saved = savedDraft(item);
-      if (!saved) throw new PublicError(409, '没有可查看的候选预览。');
-      const { files } = store.get('SELECT draft_files AS files FROM generation_runs WHERE message_id = ?', saved.message_id);
-      if (item.active_revision) await preview.stop(item.id);
-      await startDraft(item, { ...saved, files });
-      return projectView(ownedProject(request));
-    }
-    const draft = activeDraft(item);
-    if (draft) {
-      await preview.delete(draft.key, () => [{ id: draft.id }]);
-      draftPreviews.delete(item.id);
-    }
-    await preview.start(item, () => {
-      const current = ownedProject(request);
-      return { current, revision: revision(current) };
-    });
-    return projectView(ownedProject(request));
-  });
-  route('POST', '/projects/:id/preview/stop', async (request) => {
-    const item = ownedProject(request);
-    const draft = activeDraft(item);
-    if (draft) await preview.delete(draft.key, () => [{ id: draft.id }]);
-    else await preview.stop(item.id);
-    if (draft && draftPreviews.get(item.id) === draft) draftPreviews.delete(item.id);
-    return projectView(ownedProject(request));
-  });
+  route('POST', '/projects/:id/preview/start', async (request) =>
+    openProjectPreview(ownedProject(request), request.body?.draft === true));
+  route('POST', '/projects/:id/preview/stop', async (request) =>
+    closeProjectPreview(ownedProject(request)));
   route('GET', '/projects/:id/preview', async (request) => {
     const item = ownedProject(request);
     const draft = activeDraft(item);

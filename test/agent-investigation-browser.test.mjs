@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { previewTestActions } from '../server/generation-browser.mjs';
 import { browserTest } from '../server/browser-runner.mjs';
 
 const executablePath = process.env.BUILDER_TEST_CHROMIUM;
@@ -91,10 +90,10 @@ test('real preview accepts a rewritten static navigation selector after scoped i
     'admin.html': '<h1>后台管理</h1>' };
   const ambiguous = await browserTest({ files: website, actions: [{ action: 'click', selector: '.add' }] }, { executablePath });
   assert.match(ambiguous.steps[0].error, /strict mode violation/);
-  const fixed = await browserTest({ files: website, actions: previewTestActions([
+  const fixed = await browserTest({ files: website, actions: [
     { action: 'click', selector: '#first' }, { action: 'click', selector: 'a[href="admin.html"]' },
     { action: 'assert_text', value: '后台管理' }
-  ]) }, { executablePath });
+  ] }, { executablePath });
   assert.equal(fixed.status, 'passed', JSON.stringify(fixed));
 });
 
@@ -111,4 +110,18 @@ test('the acceptance runner supports long suites and selects a native option by 
   const result = await browserTest({ files: website, actions: tests }, { executablePath });
   assert.equal(result.status, 'passed', JSON.stringify(result.steps.at(-1)));
   assert.equal(result.steps.length, 24);
+});
+
+test('real Chromium can open the requested page directly at a phone viewport', {
+  skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable', timeout: 12000
+}, async () => {
+  const website = { ...files, 'index.html': '<h1>概览</h1>', 'calendar.html':
+    '<style>.phone{display:none;opacity:0}@media(max-width:400px){.phone{display:block}}</style>' +
+    '<main><p class="phone">手机日历</p></main><script>setTimeout(() => document.querySelector(".phone").style.opacity=1, 350)</script>' };
+  const result = await browserTest({ files: website, page: 'calendar.html', viewport: { width: 375, height: 812 },
+    actions: [{ action: 'assert_layout', selector: '.phone', scope: 'main', metric: 'rightInset', comparison: 'min', limit: 0 },
+      { action: 'assert_text', value: '手机日历' }] }, { executablePath });
+  assert.equal(result.status, 'passed', JSON.stringify(result));
+  assert.equal(result.steps[0].measurement.width, 375);
+  assert.equal(result.steps[0].measurement.page, 'calendar.html');
 });

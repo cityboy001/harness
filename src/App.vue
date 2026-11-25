@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   ArrowLeft, Blocks, Check, ChevronDown, CircleAlert, Code2, Ellipsis, FileCode2, FolderOpen, 
   Copy, Globe2, Link2, LoaderCircle, LockKeyhole, LogOut, Monitor, Pencil, Play, Plus, RotateCw, Send, Settings2,
@@ -8,6 +8,77 @@ import {
 import { ApiError, api, message, type Conversation, type Model, type Project, type ProjectChat, type ProjectWorkspace, type Revision, type SharedRevision, type ShareLink, type User } from './api';
 import PreviewFrame from './PreviewFrame.vue';
 import AgentProgress from './AgentProgress.vue';
+
+const conversationPane = ref<HTMLElement | null>(null);
+const conversationWidth = ref<number>();
+const actualConversationWidth = ref(265);
+const workspaceWidth = ref(0);
+const draggingDivider = ref(false);
+let dividerPointer: number | undefined;
+let dividerOffset = 0;
+
+const minimumConversationWidth = 265;
+const minimumPreviewWidth = 280;
+const dividerWidth = 10;
+const maximumConversationWidth = computed(() =>
+  Math.max(minimumConversationWidth, Math.floor(workspaceWidth.value - minimumPreviewWidth - dividerWidth)));
+
+watch(conversationPane, (pane, _, onCleanup) => {
+  const workspace = pane?.parentElement;
+  if (!workspace || !pane) return;
+  const syncWidths = () => {
+    actualConversationWidth.value = Math.round(pane.getBoundingClientRect().width);
+    workspaceWidth.value = workspace.getBoundingClientRect().width;
+  };
+  const observer = new ResizeObserver(syncWidths);
+  observer.observe(workspace);
+  observer.observe(pane);
+  syncWidths();
+  onCleanup(() => {
+    observer.disconnect();
+    dividerPointer = undefined;
+    draggingDivider.value = false;
+  });
+});
+
+function resizeConversation(width: number) {
+  conversationWidth.value = Math.min(maximumConversationWidth.value, Math.max(minimumConversationWidth, Math.round(width)));
+}
+
+function startDividerDrag(event: PointerEvent) {
+  if (event.button !== 0 || dividerPointer !== undefined) return;
+  const divider = event.currentTarget as HTMLElement;
+  divider.setPointerCapture(event.pointerId);
+  divider.focus({ preventScroll: true });
+  dividerPointer = event.pointerId;
+  dividerOffset = event.clientX - divider.getBoundingClientRect().left;
+  draggingDivider.value = true;
+}
+
+function moveDivider(event: PointerEvent) {
+  if (dividerPointer !== event.pointerId) return;
+  const workspace = (event.currentTarget as HTMLElement).parentElement;
+  if (workspace) resizeConversation(event.clientX - workspace.getBoundingClientRect().left - dividerOffset);
+}
+
+function endDividerDrag(event: PointerEvent) {
+  if (dividerPointer !== event.pointerId) return;
+  dividerPointer = undefined;
+  draggingDivider.value = false;
+}
+
+function resizeDividerByKey(event: KeyboardEvent) {
+  const currentWidth = conversationPane.value?.getBoundingClientRect().width ?? actualConversationWidth.value;
+  const widths: Record<string, number> = {
+    ArrowLeft: currentWidth - 24,
+    ArrowRight: currentWidth + 24,
+    Home: minimumConversationWidth,
+    End: maximumConversationWidth.value
+  };
+  if (!Object.hasOwn(widths, event.key)) return;
+  event.preventDefault();
+  resizeConversation(widths[event.key]);
+}
 
 const user = ref<User | null>(null);
 const initialized = ref(false);
@@ -422,6 +493,12 @@ async function runPreview(start: boolean, draft = false) {
     if (token === viewToken) starting.value = false;
   }
 }
+function sendOnEnter(event: KeyboardEvent) {
+  if (event.shiftKey || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  if (!event.repeat && activeModel.value?.available) void generate();
+}
+
 async function generate(value = prompt.value, retryModel?: string, resumeMessageId?: string) {
   if (!current.value || running.value || sending.value || loadingChat.value || !value.trim()) return;
   const token = viewToken;
@@ -643,8 +720,9 @@ onUnmounted(() => {
       </div>
     </main>
 
-    <main v-else class="workspace">
-      <aside class="conversation">
+    <main v-else class="workspace" :class="{ 'resizing-workspace': draggingDivider }"
+      :style="{ '--conversation-width': conversationWidth === undefined ? undefined : conversationWidth + 'px' }">
+      <aside id="conversation-pane" ref="conversationPane" class="conversation">
         <header class="pane-head chat-head">
           <strong>建站对话</strong>
           <select :value="selectedChat" aria-label="切换对话" @change="selectChat(($event.target as HTMLSelectElement).value)">
@@ -690,7 +768,7 @@ onUnmounted(() => {
           </div>
           <p v-if="workspaceError || pollError" class="error" role="alert">{{ workspaceError || pollError }}</p>
           <form class="composer" @submit.prevent="generate()">
-            <textarea v-model="prompt" aria-label="建站需求" :placeholder="current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
+            <textarea v-model="prompt" @keydown.enter="sendOnEnter" aria-label="建站需求" :placeholder="current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
             <div class="composer-actions">
               <div class="model-choice">
                 <select v-model="selectedModel" aria-label="调用模型">
@@ -705,6 +783,12 @@ onUnmounted(() => {
           </form>
         </div>
       </aside>
+      <div class="workspace-divider" role="separator" tabindex="0" aria-orientation="vertical"
+        aria-label="调整对话和预览宽度" aria-controls="conversation-pane"
+        :aria-valuemin="minimumConversationWidth" :aria-valuemax="maximumConversationWidth"
+        :aria-valuenow="actualConversationWidth" @pointerdown="startDividerDrag" @pointermove="moveDivider"
+        @pointerup="endDividerDrag" @pointercancel="endDividerDrag" @lostpointercapture="endDividerDrag"
+        @keydown="resizeDividerByKey"></div>
       <section class="result">
         <header class="pane-head result-head">
           <div class="tabs" aria-label="结果视图">

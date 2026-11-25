@@ -420,3 +420,240 @@ test('ReAct accepts a streamed stage larger than 8 KiB and recovers from an over
   assert.match(result.files['index.html'], /<h1>菜单<\/h1>/);
   assert.equal(staged, 2);
 });
+
+test('LangChain ReAct debits one 32000-token budget across tool calls and format correction', async () => {
+  const requests = [];
+  const output = await buildWebsite({ platform: true }, '回答问题', undefined, async (_model, messages, tokens, options) => {
+    requests.push([tokens, options.toolChoice]);
+    if (requests.length === 1) {
+      return { usage: { completion_tokens: 24000 }, message: { reasoning_content: '先记下步骤', tool_calls: [
+        { id: 'plan-call', type: 'function', function: { name: 'update_plan', arguments: '{"steps":["回答问题"]}' } }
+      ] } };
+    }
+    assert.ok(messages.some(message => message.role === 'assistant' && message.reasoning_content === '先记下步骤'));
+    if (requests.length === 2) {
+      assert.ok(messages.some(message => message.role === 'tool' && message.tool_call_id === 'plan-call'));
+      return { usage: { completion_tokens: 160 }, message: { content: '直接答复的错误格式' } };
+    }
+    assert.ok(messages.some(message => message.content.includes('格式错误')));
+    return '{"answer":"答案"}';
+  }, { maxTokens: 32000, react: true });
+  assert.deepEqual(requests, [[32000, undefined], [8000, 'none'], [7840, 'none']]);
+  assert.deepEqual(output, { files: null, summary: '答案' });
+});
+
+test('LangChain ReAct runs dependent tools in the order returned by the model', async () => {
+  const events = [];
+  let calls = 0;
+  const result = await buildWebsite({ platform: true }, '生成站点', undefined, async (_model, messages) => {
+    if (calls++ === 0) {
+      return { message: { tool_calls: [
+        { id: 'stage', type: 'function', function: { name: 'stage_changes', arguments: JSON.stringify({ files: project }) } },
+        { id: 'check', type: 'function', function: { name: 'test_preview',
+          arguments: JSON.stringify({ candidate: 'candidate-1', actions: [{ action: 'assert_text', value: 'Old title' }] }) } }
+      ] } };
+    }
+    const results = messages.filter(message => message.role === 'tool').map(message => JSON.parse(message.content).status);
+    assert.deepEqual(results, ['ok', 'passed']);
+    return '{"summary":"已检查","candidate":"candidate-1"}';
+  }, {
+    maxTokens: 32000, react: true, requireBrowser: true,
+    onActivity: event => events.push(event.detail),
+    testBrowser: async (_files, actions) => ({ status: 'passed', steps: actions.map(({ action }) => ({ action, ok: true })) })
+  });
+  assert.deepEqual(events, ['已保存候选 candidate-1', '浏览器检查通过']);
+  assert.equal(result.files['index.html'], project['index.html']);
+});
+
+test('ReAct delegates parallel scoped helpers and debits their actual usage from the parent budget', { timeout: 5000 }, async () => {
+  const started = Promise.withResolvers();
+  const firstRound = new Set();
+  const budgetRequests = [];
+  const activity = [];
+  const delegated = [
+    { title: '源码检查', objective: '读首页并确认标题', paths: ['index.html'] },
+    { title: '浏览器检查', objective: '检查可见标题并用沙箱计算', paths: [] }
+  ];
+  const call = (id, name, args, tokens) => ({
+    usage: { completion_tokens: tokens },
+    message: { tool_calls: [{ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }] }
+  });
+  const answer = (content, tokens) => ({ usage: { completion_tokens: tokens }, message: { content } });
+  const output = await buildWebsite({ platform: true }, '检查网站', project, async (_config, messages, tokens, options) => {
+    const results = messages.filter(m => m.role === 'tool').map(m => JSON.parse(m.content));
+    if (!messages[0].content.includes('临时建站辅助 Agent')) {
+      budgetRequests.push(tokens);
+      if (!results.length) return call('delegate', 'delegate_tasks', { tasks: delegated }, 1000);
+      assert.deepEqual(results[0].results, [
+        { title: '源码检查', status: 'done', summary: '首页标题来自 index.html。' },
+        { title: '浏览器检查', status: 'done', summary: '浏览器看到标题，计算得 42。' }
+      ]);
+      return '{"answer":"检查完成"}';
+    }
+    const { title } = JSON.parse(messages[1].content);
+    const tools = options.tools.map(t => t.function.name);
+    assert.ok(!tools.some(t => ['delegate_tasks', 'stage_changes', 'open_preview', 'close_preview'].includes(t)));
+    if (!firstRound.has(title)) {
+      assert.equal(tokens, 6000);
+      firstRound.add(title);
+      if (firstRound.size === 2) started.resolve();
+      await started.promise;
+    }
+    if (title === '源码检查') {
+      if (!results.length) return call('read', 'read_files', { paths: ['index.html', 'server.js'] }, 100);
+      assert.equal(results[0].files[0].content, project['index.html']);
+      assert.ok(results[0].files[1].error);
+      return answer('首页标题来自 index.html。', 200);
+    }
+    assert.deepEqual(tools, ['test_preview', 'run_code']);
+    if (!results.length) return call('check', 'test_preview', { actions: [{ action: 'assert_text', value: 'Old title' }] }, 100);
+    if (results.length === 1) {
+      assert.equal(results[0].status, 'passed');
+      return call('code', 'run_code', { source: 'console.log(42)' }, 50);
+    }
+    assert.equal(results[1].output, '42');
+    return answer('浏览器看到标题，计算得 42。', 100);
+  }, {
+    react: true, maxTokens: 32000,
+    onActivity: event => activity.push(event),
+    async testBrowser(files, steps) {
+      assert.equal(files['index.html'], project['index.html']);
+      assert.equal(steps[0].value, 'Old title');
+      return { status: 'passed', steps: [{ action: 'assert_text', ok: true }] };
+    },
+    async runCode(source) {
+      assert.equal(source, 'console.log(42)');
+      return { exitCode: 0, output: '42' };
+    }
+  });
+  assert.deepEqual(budgetRequests, [32000, 30450]);
+  assert.deepEqual(activity.map(event => event.detail), ['子 Agent 开始', '子 Agent 开始', '子 Agent 完成', '子 Agent 完成']);
+  assert.deepEqual(output, { files: null, summary: '检查完成' });
+});
+
+test('parallel editors submit scoped patches and the main agent merges and tests the combined candidate', async () => {
+  const files = { ...project, 'app.js': 'const title = "Old";', 'style.css': 'h1 { color: red; }' };
+  const tasks = [
+    { title: '脚本', objective: '修改脚本', paths: [], writePaths: ['app.js'] },
+    { title: '样式', objective: '修改样式', paths: [], writePaths: ['style.css'] }
+  ];
+  let toolId = 0;
+  const call = (name, args) => ({ usage: { completion_tokens: 100 },
+    message: { tool_calls: [{ id: 'edit-test-' + ++toolId, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } });
+  const stage = [];
+  const checked = [];
+  let parentTurn = 0;
+  const output = await buildWebsite({ platform: true }, '分别修改脚本和样式', files, async (_, messages, _budget, options) => {
+    const results = messages.filter(m => m.role === 'tool').map(m => JSON.parse(m.content));
+    if (messages[0].content.includes('临时建站辅助 Agent')) {
+      const { writePaths: [path] } = JSON.parse(messages[1].content);
+      assert.ok(options.tools.some(t => t.function.name === 'submit_patch'));
+      if (!results.length) return call('read_files', { paths: [path] });
+      if (results.length === 1 && path === 'app.js') return call('submit_patch', { changes: { 'index.html': '<h1>越权</h1>' } });
+      if (results.length === 1 || (path === 'app.js' && results.length === 2)) {
+        if (path === 'app.js') assert.match(results.at(-1).error, /范围之外/);
+        const value = path === 'app.js' ? 'const title = "New";' : 'h1 { color: blue; }';
+        return call('submit_patch', { changes: { [path]: value } });
+      }
+      assert.deepEqual(results.at(-1), { status: 'ok', files: [path] });
+      return '完成本文件修改。';
+    }
+    switch (++parentTurn) {
+      case 1: return call('delegate_tasks', { tasks: [tasks[0], { ...tasks[1], writePaths: ['APP.js'] }] });
+      case 2:
+        assert.match(results.at(-1).error, /冲突或重复/);
+        return call('delegate_tasks', { tasks });
+      case 3:
+        assert.equal(results.at(-1).batch, 'batch-1');
+        assert.deepEqual(results.at(-1).results.map(r => r.files), [['app.js'], ['style.css']]);
+        assert.equal(stage.length, 0);
+        return call('stage_changes', { changes: { 'notice.html': '<h1>公告</h1>' } });
+      case 4: return call('merge_delegated_changes', { batch: 'batch-1' });
+      case 5:
+        assert.equal(results.at(-1).candidate, 'candidate-2');
+        return call('test_preview', { candidate: 'candidate-2', actions: [{ action: 'assert_text', value: 'Old title' }] });
+      default:
+        assert.equal(results.at(-1).status, 'passed');
+        return '{"summary":"脚本和样式已合并并检查","candidate":"candidate-2"}';
+    }
+  }, { maxTokens: 32000, react: true, requireBrowser: true, onCandidate: files => stage.push(files),
+    async testBrowser(files, actions) {
+      checked.push(files);
+      return { status: 'passed', steps: actions.map(({ action }) => ({ action, ok: true })) };
+    }
+  });
+  assert.deepEqual(checked, [output.files]);
+  assert.equal(output.files['app.js'], 'const title = "New";');
+  assert.equal(output.files['style.css'], 'h1 { color: blue; }');
+  assert.equal(output.files['notice.html'], '<h1>公告</h1>');
+  assert.equal(output.files['index.html'], project['index.html']);
+});
+
+test('merging a delegated patch rejects a file changed since delegation', async () => {
+  const files = { ...project, 'app.js': 'old();' };
+  let turn = 0;
+  const call = (id, name, args) => ({ message: { tool_calls: [
+    { id, type: 'function', function: { name, arguments: JSON.stringify(args) } }
+  ] } });
+  const saved = [];
+  await buildWebsite({ platform: true }, '修改脚本', files, async (_, messages) => {
+    const results = messages.filter(m => m.role === 'tool').map(m => JSON.parse(m.content));
+    if (messages[0].content.includes('临时建站辅助 Agent')) {
+      if (!results.length) return call('child-read', 'read_files', { paths: ['app.js'] });
+      if (results.length === 1) return call('child-write', 'submit_patch', { changes: { 'app.js': 'child();' } });
+      return '辅助改动已完成';
+    }
+    switch (++turn) {
+      case 1: return call('parent-delegate', 'delegate_tasks', { tasks: [
+        { title: '改脚本', objective: '辅助改动', paths: [], writePaths: ['app.js'] }
+      ] });
+      case 2: return call('parent-read', 'read_files', { paths: ['app.js'] });
+      case 3: return call('parent-write', 'stage_changes', { changes: { 'app.js': 'parent();' } });
+      case 4: return call('parent-merge', 'merge_delegated_changes', { batch: 'batch-1' });
+      default:
+        assert.match(results.at(-1).error, /分派后以下文件已修改/);
+        assert.deepEqual(results.at(-1).files, ['app.js']);
+        return '{"answer":"检测到冲突"}';
+    }
+  }, { react: true, maxTokens: 32000, onCandidate: files => saved.push(files) });
+  assert.deepEqual(saved.map(files => files['app.js']), ['parent();']);
+});
+
+test('editor helpers accumulate small patches, preserve a partial patch after truncation, and can submit during finalization', async () => {
+  const call = (id, name, args, used = 100) => ({ usage: { completion_tokens: used }, message: { tool_calls: [
+    { id, type: 'function', function: { name, arguments: JSON.stringify(args) } }
+  ] } });
+  let parent = 0;
+  const activity = [];
+  const output = await buildWebsite({ platform: true }, '并行添加页面文件', project, async (_, messages, tokens, options) => {
+    const observations = messages.filter(m => m.role === 'tool').map(m => JSON.parse(m.content));
+    if (!messages[0].content.includes('临时建站辅助 Agent')) {
+      switch (++parent) {
+        case 1: return call('delegate', 'delegate_tasks', { tasks: [
+          { title: '脚本', objective: '新增两个脚本', paths: [], writePaths: ['a.js', 'b.js'] },
+          { title: '样式', objective: '新增样式', paths: [], writePaths: ['style.css'] }
+        ] });
+        case 2:
+          assert.equal(observations[0].results[0].status, 'partial');
+          assert.match(observations[0].results[0].error, /预算/);
+          assert.deepEqual(observations[0].results[0].files, ['a.js', 'b.js']);
+          assert.equal(observations[0].results[1].status, 'done');
+          return call('merge', 'merge_delegated_changes', { batch: observations[0].batch });
+        default: return JSON.stringify({ summary: '并行改动已合并', candidate: observations.at(-1).candidate });
+      }
+    }
+    const { title } = JSON.parse(messages[1].content);
+    if (title === '脚本') {
+      if (!observations.length) return call('first', 'submit_patch', { changes: { 'a.js': 'const a = 1;' } });
+      if (observations.length === 1) return call('second', 'submit_patch', { changes: { 'b.js': 'const b = 2;' } });
+      throw new ModelOutputLimitError();
+    }
+    if (!observations.length && tokens === 9000) return call('first', 'submit_patch', { changes: {} }, 8640);
+    assert.equal(tokens, 360);
+    assert.equal(options.toolChoice, 'none');
+    return '{"changes":{"style.css":"h1 { color: blue; }"},"summary":"样式完成"}';
+  }, { maxTokens: 32000, react: true, onActivity: event => activity.push(event) });
+  assert.deepEqual([output.files['a.js'], output.files['b.js'], output.files['style.css']],
+    ['const a = 1;', 'const b = 2;', 'h1 { color: blue; }']);
+  assert.ok(activity.some(event => event.detail === '子 Agent 部分完成' && event.decision.includes('预算')));
+});

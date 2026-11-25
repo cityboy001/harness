@@ -15,6 +15,7 @@ export class Guest {
       : spawn(process.execPath, [guest, join(directory, 'data.sqlite')], {
         env, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true
       });
+    this.closed = new Promise(resolve => this.child.once('close', resolve));
     const lines = createInterface({ input: this.child.stdout, crlfDelay: Infinity });
     lines.on('line', (line) => {
       let result;
@@ -53,7 +54,7 @@ export class Guest {
   }
 
   stop() {
-    if (this.dead) return;
+    if (this.dead) return this.closed;
     this.dead = true;
     this.finish(new PublicError(503, '预览运行环境已停止。'));
     this.child.stdin.end();
@@ -62,6 +63,7 @@ export class Guest {
       if (child.exitCode === null) child.kill();
     }, 1500);
     force.unref();
+    return this.closed;
   }
 }
 
@@ -90,8 +92,9 @@ export function makePreviews(directory, { launcher, max, idleMs, log }) {
   }
 
   function clear(projectId) {
-    running.get(projectId)?.guest.stop();
+    const guest = running.get(projectId)?.guest;
     running.delete(projectId);
+    return guest?.stop();
   }
 
   function capacity(project) {
@@ -118,7 +121,7 @@ export function makePreviews(directory, { launcher, max, idleMs, log }) {
       await guest.send({ type: 'load', source: files['server.js'], setup }, 20000);
       return guest;
     } catch (error) {
-      guest.stop();
+      await guest.stop();
       throw error;
     } finally {
       signal?.removeEventListener('abort', cancel);
@@ -147,9 +150,9 @@ export function makePreviews(directory, { launcher, max, idleMs, log }) {
       if (reserved.has(projectId) && !run) return 'starting';
       return run && !run.guest.dead ? 'running' : 'stopped';
     },
-    async activate(project, id, files, commit, signal) {
+    async activate(project, id, files, commit, signal, startPreview = true) {
       return exclusive(project.id, async () => {
-        let startAutomatically = true;
+        let startAutomatically = startPreview;
         try {
           capacity(project);
         } catch {
@@ -162,10 +165,13 @@ export function makePreviews(directory, { launcher, max, idleMs, log }) {
           guest = await openGuest(project, id, files, true, signal);
           commit();
           if (startAutomatically) install(project, id, guest);
-          else guest.stop();
+          else {
+            clear(project.id);
+            guest.stop();
+          }
           if (project.active_revision) removeData(project.active_revision);
         } catch (error) {
-          guest?.stop();
+          await guest?.stop();
           removeData(id);
           throw error;
         } finally {
@@ -186,7 +192,7 @@ export function makePreviews(directory, { launcher, max, idleMs, log }) {
           if (initialize) initialize();
           install(project, revision.id, guest);
         } catch (error) {
-          guest?.stop();
+          await guest?.stop();
           if (initialize) removeData(revision.id);
           throw error;
         } finally {
@@ -198,9 +204,9 @@ export function makePreviews(directory, { launcher, max, idleMs, log }) {
       return exclusive(projectId, () => clear(projectId));
     },
     delete(projectId, action) {
-      return exclusive(projectId, () => {
+      return exclusive(projectId, async () => {
         const revisions = action();
-        clear(projectId);
+        await clear(projectId);
         revisions.forEach(({ id }) => removeData(id));
       });
     },
@@ -220,7 +226,7 @@ export function makePreviews(directory, { launcher, max, idleMs, log }) {
     async close() {
       clearInterval(timer);
       await Promise.all(locks.values());
-      for (const id of running.keys()) clear(id);
+      await Promise.all([...running.keys()].map(clear));
     }
   };
 }

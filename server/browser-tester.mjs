@@ -6,7 +6,7 @@ export function makeBrowserTester(launcher) {
   if (!launcher) return undefined;
   let queue = Promise.resolve();
 
-  function run(files, actions, signal) {
+  function run(files, actions, signal, context) {
     return new Promise((resolve) => {
       if (signal.aborted) return resolve(unavailable);
       const child = spawn('/usr/bin/sudo', ['-n', launcher], { env: {}, stdio: ['pipe', 'pipe', 'ignore'] });
@@ -39,12 +39,12 @@ export function makeBrowserTester(launcher) {
           finish(unavailable);
         }
       });
-      child.stdin.end(JSON.stringify({ files, actions }));
+      child.stdin.end(JSON.stringify({ files, actions, ...context }));
     });
   }
 
-  return (files, actions, signal) => {
-    const job = queue.then(() => run(files, actions, signal));
+  return (files, actions, signal, context) => {
+    const job = queue.then(() => run(files, actions, signal, context));
     queue = job.catch(() => {});
     if (signal.aborted) return Promise.resolve(unavailable);
     return new Promise((resolve, reject) => {

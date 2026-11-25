@@ -92,9 +92,30 @@ p { line-height: 1.6; }
 .empty-projects { background: var(--surface); border: 1px dashed #c9c3e0; border-radius: 16px; min-height: 270px; display: grid; justify-items: center; align-content: center; padding: 20px; text-align: center; gap: 10px; }
 .empty-projects button { margin-top: 4px; }
 
-.workspace { display: grid; grid-template-columns: minmax(285px, .97fr) minmax(0, 1.9fr); min-height: calc(100dvh - 66px); background: var(--surface); }
+.workspace {
+  --conversation-default: 33.8%;
+  display: grid;
+  grid-template-columns: clamp(265px, var(--conversation-width, var(--conversation-default)), calc(100% - 290px)) 10px minmax(0, 1fr);
+  min-height: calc(100dvh - 66px);
+  background: var(--surface);
+}
+.workspace-divider {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+  background: var(--canvas);
+}
+.workspace-divider::before {
+  content: "";
+  position: absolute;
+  inset: 0 4px;
+  background: var(--line);
+}
+.workspace-divider:hover::before, .workspace-divider:focus-visible::before,
+.resizing-workspace .workspace-divider::before { background: var(--accent); }
+.resizing-workspace { cursor: col-resize; user-select: none; }
+.resizing-workspace iframe { pointer-events: none; }
 .conversation, .result { min-width: 0; display: flex; flex-direction: column; }
-.conversation { border-right: 1px solid var(--line); }
 .pane-head { display: flex; min-height: 57px; padding: 8px clamp(12px, 2vw, 22px); align-items: center; justify-content: space-between; gap: 6px; border-bottom: 1px solid var(--line); }
 .chat-head > strong, .chat-head > button { flex-shrink: 0; white-space: nowrap; }
 .chat-head > select { flex: 1; min-width: 0; max-width: 220px; margin-left: auto; text-overflow: ellipsis; }
@@ -176,11 +197,12 @@ p { line-height: 1.6; }
 .success { display: flex; align-items: center; gap: 6px; color: var(--green); }
 
 @media (max-width: 850px) {
-  .workspace { grid-template-columns: minmax(265px, 1fr) minmax(0, 1.5fr); }
+  .workspace { --conversation-default: 40%; }
 }
 @media (max-width: 620px) {
   .workspace { grid-template-columns: 1fr; }
-  .conversation { border-right: 0; border-bottom: 1px solid var(--line); }
+  .workspace-divider { display: none; }
+  .conversation { border-bottom: 1px solid var(--line); }
   .thread { min-height: 155px; max-height: 42dvh; }
   .empty-thread { min-height: 115px; }
   .source-stage { grid-template-columns: 1fr; }

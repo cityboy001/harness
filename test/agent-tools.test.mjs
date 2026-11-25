@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { buildWebsite } from '../server/generation.mjs';
-import { createBrowserTools, previewActions, previewActionError } from '../server/generation-browser.mjs';
+import { browserTestLimit, createBrowserTools, previewActions, previewActionError } from '../server/generation-browser.mjs';
 import { loadProjectMemory } from '../server/project-memory.mjs';
 import { openStore } from '../server/storage.mjs';
 
@@ -256,19 +256,24 @@ test('preview distinguishes unavailable, exhausted, and a different untested fin
   const browser = createBrowserTools(async (incoming, actions) => {
     checked.push([incoming, actions.map(({ action }) => action)]);
     if (checked.length === 1) return { status: 'unavailable', error: 'Chromium unavailable for this call' };
-    if (checked.length === 2) return { status: 'passed', steps: [{ action: 'assert_text', ok: true }] };
-    return { status: 'failed', error: 'Untested draft does not load' };
+    if (incoming === different) return { status: 'failed', error: 'Untested draft does not load' };
+    return { status: 'passed', steps: [{ action: 'assert_text', ok: true }] };
   }, undefined, (input) => ({ files: input.files }), AbortSignal.timeout(1000));
   const first = await browser.call({ files: draft, actions: [{ action: 'assert_text', value: 'Tested' }] });
   assert.deepEqual(first, { status: 'unavailable', error: 'Chromium unavailable for this call', candidate: 'candidate-1' });
   const second = await browser.call({ candidate: first.candidate, actions: [{ action: 'assert_text', value: 'Tested' }] });
   assert.deepEqual(second, { status: 'passed', steps: [{ action: 'assert_text', ok: true }], candidate: 'candidate-1' });
+  const rejected = await browser.call({ candidate: first.candidate, page: 'missing.html', actions: browserActions });
+  assert.equal(rejected.status, 'invalid');
+  assert.equal(browser.attempts, 2);
+  while (browser.canTest) await browser.call({ candidate: first.candidate, actions: [{ action: 'assert_text', value: 'Tested' }] });
   const exhausted = await browser.call({ candidate: first.candidate, actions: browserActions });
-  assert.equal(exhausted.status, 'unavailable');
-  assert.match(exhausted.error, /budget is exhausted/);
+  assert.equal(exhausted.status, 'exhausted');
+  assert.match(exhausted.error, /没有运行这次检查/);
+  assert.deepEqual(browser.recoverVerifiedDraft().files, draft);
   assert.deepEqual((await browser.finish(first.candidate, { summary: 'Tested' })).files, draft);
   await assert.rejects(browser.finish(undefined, { files: different, summary: 'Different' }), /Untested draft does not load/);
-  assert.deepEqual(checked, [[draft, ['assert_text']], [draft, ['assert_text']], [different, ['inspect']]]);
+  assert.deepEqual(checked, [...Array.from({ length: browserTestLimit }, () => [draft, ['assert_text']]), [different, ['inspect']]]);
 });
 
 test('history tool returns exact scoped data and enforces the lookup limit and invalid-argument contract', async (t) => {

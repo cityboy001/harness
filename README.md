@@ -13,9 +13,9 @@
 
 首次生成返回完整站点，后续修改先向模型提供文件清单，再按需提供它请求的源码。平台校验新增、替换和删除的文件，合并成候选版本后交给沙箱。对话区可展开查看 DeepSeek 返回的思考文字，生成期间会持续更新。
 
-请求直接交给模型。DeepSeek 使用一轮轮工具调用来执行多步任务，可记录简短计划、读取源码、运行沙箱代码、保存候选和检查预览。模型根据结果修正候选或直接回答。候选通过已配置的浏览器检查后激活。失败时可以继续修改已保存的候选。
+请求直接交给模型。DeepSeek 使用 LangChain createAgent 的单 Agent 工具循环来执行多步任务，可记录简短计划、读取源码、运行沙箱代码、保存候选和检查预览。模型根据结果修正候选或直接回答。可以在对话中要求模型打开或关闭工作台预览。候选通过已配置的浏览器检查后激活。失败时可以继续修改已保存的候选。
 
-每个项目的原始对话保存在 `messages`，移出最近四轮的内容会分批提炼到 `project_memory` 滚动摘要。主控 Agent 可以按短语或对话 ID 查同项目的原始记录。执行任务时，Worker 接收该任务引用的证据、依赖产出和共享接口。
+每个项目的原始对话保存在 `messages`，移出最近四轮的内容会分批提炼到 `project_memory` 滚动摘要。主控 Agent 可以按短语或对话 ID 查同项目的原始记录。主 Agent 可用 delegate_tasks 并行委派调查和修改。编辑任务使用互不重叠的 writePaths。子 Agent 从同一快照读取文件，通过 submit_patch 提交补丁，也可使用浏览器或代码工具。主 Agent 用 merge_delegated_changes 合并到最新候选，检查并发布。主 Agent 和子 Agent 共用整次输出预算。
 
 本地预览在独立 Node 子进程的 QuickJS WebAssembly 沙箱中执行，应用数据默认放在 `.builder-data`。生成的网页在无同源权限的 iframe 中渲染，项目 API 经工作区转发并检查会话和项目归属。
 
@@ -29,7 +29,7 @@
 
 将 `PLATFORM_USER_DAILY_LIMIT`、`PLATFORM_DAILY_LIMIT` 或 `CUSTOM_USER_DAILY_LIMIT` 设为 0，可以关闭对应的每日次数限制。
 
-DeepSeek 的单个生成任务默认使用 `DEEPSEEK_MAX_TOKENS=32000`，思考、工具调用和最终输出共用这个预算。其他兼容接口使用 `MODEL_MAX_TOKENS`。
+DeepSeek 的单个生成任务默认使用 `DEEPSEEK_MAX_TOKENS=64000`，思考、工具调用和最终输出共用这个预算。其他兼容接口使用 `MODEL_MAX_TOKENS`。
 
 设置 `BROWSER_TEST_LAUNCHER=/usr/local/sbin/ai-site-builder-browser-test` 可启用 DeepSeek 的浏览器测试工具。先用 `deploy/Dockerfile.browser` 构建 `ai-site-builder-browser:1`，再安装启动脚本和对应 sudoers 规则。每次测试都在禁网的临时 Chromium 容器中运行，使用独立的测试数据库。
 

@@ -264,7 +264,7 @@ test('complete build workflow, account boundaries and rollback', async (t) => {
       const current = input.startsWith('{') ? JSON.parse(input).request : input;
       if (current === 'question only') return JSON.stringify({ answer: '待办数据存在项目 SQLite 中。' });
       if (config.platform) {
-        assert.equal(limit, 32000);
+        assert.equal(limit, 64000);
         options.onReasoning('正在规划页面。');
         reasoningStarted.resolve();
         await finishFirstGeneration.promise;
@@ -458,4 +458,95 @@ test('zero daily limits allow generation after previous usage', async (t) => {
     });
     assert.equal(result.statusCode, 202, result.body);
   }
+});
+
+test('the agent opens and closes the workspace preview without changing the published revision', async t => {
+  const data = await mkdtemp(join(tmpdir(), 'site-builder-preview-tool-'));
+  const observed = [];
+  const app = await createApp({
+    data, origin, deepseekKey: 'fixture', demo: true,
+    async completion(_config, messages, _tokens, options) {
+      const prompt = messages[1].content.split('\n')[1];
+      const toolResult = messages.find(({ role }) => role === 'tool');
+      if (toolResult) {
+        observed.push(JSON.parse(toolResult.content));
+        return prompt === '关闭预览并添加公告页'
+          ? '{"summary":"已添加","changes":{"notice.html":"<h1>公告</h1>"}}'
+          : '{"answer":"预览操作完成"}';
+      }
+      const name = prompt.startsWith('关闭预览') ? 'close_preview' : 'open_preview';
+      assert.ok(options.tools.some(tool => tool.function.name === name));
+      return { message: { tool_calls: [{ id: 'preview-call', type: 'function',
+        function: { name, arguments: '{}' } }] } };
+    }
+  });
+  t.after(async () => { await app.close(); await rm(data, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+  let cookie;
+  const request = (method, path, payload) => app.inject({
+    method, url: '/api/' + path, payload, headers: { origin, ...(cookie && { cookie }) }
+  });
+  cookie = (await request('POST', 'register', { name: 'preview-tool-owner', password: 'preview-tool-test' })).headers['set-cookie'].split(';')[0];
+  const path = 'projects/' + (await request('POST', 'projects', { name: '预览工具' })).json().id;
+  async function generate(prompt, modelId) {
+    const started = await request('POST', path + '/generate', { prompt, modelId });
+    assert.equal(started.statusCode, 202, started.body);
+    for (let i = 0; i < 150; i++) {
+      const snapshot = (await request('GET', path)).json();
+      const message = snapshot.messages.find(item => item.id === started.json().id);
+      if (message.state !== 'running') {
+        assert.equal(message.state, 'complete', message.response);
+        return { project: snapshot.project, message };
+      }
+      await delay(25);
+    }
+    assert.fail('Generation did not finish');
+  }
+
+  const empty = await generate('打开预览', 'platform');
+  assert.equal(empty.project.preview, 'stopped');
+  assert.match(observed[0].error, /没有可查看的候选/);
+  const initial = await generate('生成待办网站', 'demo');
+  const closed = await generate('关闭预览', 'platform');
+  assert.equal(closed.project.preview, 'stopped');
+  assert.equal(closed.message.result_type, 'answer');
+  assert.equal(closed.message.agent_events.at(-1).detail, '已关闭预览');
+  const opened = await generate('打开预览', 'platform');
+  assert.equal(opened.project.preview, 'running');
+  assert.equal(opened.message.agent_events.at(-1).detail, '已打开预览');
+  assert.equal(closed.project.revision, initial.project.revision);
+  assert.equal(opened.project.revision, initial.project.revision);
+  assert.deepEqual(observed.slice(1), [{ status: 'stopped', version: 'published' }, { status: 'running', version: 'published' }]);
+  const updated = await generate('关闭预览并添加公告页', 'platform');
+  assert.notEqual(updated.project.revision, initial.project.revision);
+  assert.equal(updated.project.preview, 'stopped');
+});
+
+test('an answer after staging an unfinished candidate preserves it and exposes the continue action', async t => {
+  const data = await mkdtemp(join(tmpdir(), 'builder-unfinished-candidate-'));
+  const app = await createApp({ data, origin, deepseekKey: 'fixture',
+    async completion(_model, messages) {
+      if (messages.at(-1).role === 'tool') return '{"answer":"浏览器测试尚未完成。"}';
+      return { message: { tool_calls: [{ id: 'stage-1', type: 'function', function: { name: 'stage_changes',
+        arguments: JSON.stringify({ files: { 'index.html': '<h1>候选</h1>', 'server.js': 'function handle() {}' } }) } }] } };
+    }
+  });
+  t.after(async () => { await app.close(); await rm(data, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
+  let cookie;
+  const request = (method, path, payload) => app.inject({ method, url: '/api/' + path, payload,
+    headers: { origin, ...(cookie && { cookie }) } });
+  cookie = (await request('POST', 'register', { name: 'handoff-test', password: 'test-password' })).headers['set-cookie'].split(';')[0];
+  const path = 'projects/' + (await request('POST', 'projects', { name: '候选测试' })).json().id;
+  await request('POST', path + '/generate', { prompt: '生成网页' });
+  for (let i = 0; i < 120; i++) {
+    const data = (await request('GET', path)).json();
+    const message = data.messages[0];
+    if (message.state === 'running') { await delay(25); continue; }
+    assert.equal(message.state, 'failed');
+    assert.match(message.response, /已保留候选/);
+    assert.equal(message.has_checkpoint, 1);
+    assert.equal(data.project.hasSavedDraft, true);
+    assert.equal(data.project.revision, null);
+    return;
+  }
+  assert.fail('Generation did not finish');
 });
