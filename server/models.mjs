@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises';
 import { request } from 'node:https';
 import { isIP } from 'node:net';
+import { setTimeout as wait } from 'node:timers/promises';
 import ipaddr from 'ipaddr.js';
 
 export class PublicError extends Error {
@@ -13,6 +14,35 @@ export class PublicError extends Error {
 export class ModelOutputLimitError extends PublicError {
   constructor() {
     super(502, '模型输出达到上限，请缩小这次改动范围。');
+  }
+}
+
+export class TransientModelError extends PublicError {
+  constructor(status, message, retryAfter = 0) {
+    super(status, message);
+    this.retryAfter = retryAfter;
+  }
+}
+
+export async function retryModelCompletion(completion, config, messages, maxTokens, options = {}, onRetry) {
+  for (let attempt = 0; ; attempt++) {
+    options.signal?.throwIfAborted();
+    let streamed = false;
+    try {
+      return await completion(config, messages, maxTokens, {
+        ...options,
+        ...(options.onReasoning && { onReasoning(chunk) {
+          if (chunk) streamed = true;
+          options.onReasoning(chunk);
+        } })
+      });
+    } catch (error) {
+      if (!(error instanceof TransientModelError) || attempt >= 2 || options.test || error.retryAfter > 15000) throw error;
+      options.signal?.throwIfAborted();
+      onRetry?.(attempt + 1, error.message);
+      if (streamed) options.onReasoning('\n\n【模型连接中断，正在重新尝试这一轮】\n');
+      await wait(Math.max(error.retryAfter, 350 * 2 ** attempt), undefined, { signal: options.signal });
+    }
   }
 }
 
@@ -47,9 +77,15 @@ export function parseEndpoint(input) {
   return url;
 }
 
-function assertModelStatus(status) {
+function assertModelStatus(status, retryAfter) {
   if ([401, 403].includes(status)) throw new PublicError(422, '模型服务拒绝了请求，请检查 API Key 和模型权限。');
-  if ([402, 429].includes(status)) throw new PublicError(429, '模型服务额度不足或请求过多，请稍后重试。');
+  if (status === 402) throw new PublicError(429, '模型服务额度不足。');
+  if ([408, 429, 500, 502, 503, 504, 529].includes(status)) {
+    const delay = typeof retryAfter !== 'string' ? 0 : /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000
+      : Math.max(0, Date.parse(retryAfter) - Date.now()) || 0;
+    throw new TransientModelError(status === 429 ? 429 : 502, status === 429
+      ? '模型服务请求过多，请稍后重试。' : '模型服务暂时异常（HTTP ' + status + '）。', delay);
+  }
   if (status !== 200) throw new PublicError(502, '模型服务返回 HTTP ' + status + '，请检查接口和模型名。');
 }
 
@@ -59,6 +95,13 @@ function decodeModelJson(value) {
   } catch {
     throw new PublicError(502, '模型返回了无法识别的响应。');
   }
+}
+
+const maxToolArgumentBytes = 128 * 1024;
+export function toolArgumentLimit(name) {
+  if (name === 'stage_changes' || name === 'test_preview') return maxToolArgumentBytes;
+  if (name === 'run_code') return 64 * 1024;
+  return 8 * 1024;
 }
 
 export async function readCompletionStream(response, onReasoning) {
@@ -81,7 +124,7 @@ export async function readCompletionStream(response, onReasoning) {
       return;
     }
     const value = decodeModelJson(payload);
-    if (value?.error) throw new PublicError(502, '模型服务中断了生成。');
+    if (value?.error) throw new TransientModelError(502, '模型服务中断了生成。');
     if (value?.usage) usage = value.usage;
     const choice = value?.choices?.[0];
     if (!choice) return;
@@ -101,10 +144,17 @@ export async function readCompletionStream(response, onReasoning) {
       const call = calls.get(index) ?? { id: '', type: 'function', function: { name: '', arguments: '' } };
       if (typeof part.id === 'string') call.id += part.id;
       if (typeof part.function?.name === 'string') call.function.name += part.function.name;
-      if (typeof part.function?.arguments === 'string') call.function.arguments += part.function.arguments;
-      const argumentLimit = call.function.name === 'test_preview' ? 120000 : 8192;
-      if (call.id.length > 256 || call.function.name.length > 80 || call.function.arguments.length > argumentLimit) {
-        throw new PublicError(502, '模型工具调用超过大小上限。');
+      if (typeof part.function?.arguments === 'string' && !call.argumentOverflow) {
+        const args = call.function.arguments + part.function.arguments;
+        if (Buffer.byteLength(args) > maxToolArgumentBytes) {
+          call.argumentOverflow = true;
+          call.function.arguments = '{}';
+        } else {
+          call.function.arguments = args;
+        }
+      }
+      if (call.id.length > 256 || call.function.name.length > 80) {
+        throw new PublicError(502, '模型返回了无效的工具调用。');
       }
       calls.set(index, call);
     }
@@ -124,13 +174,19 @@ export async function readCompletionStream(response, onReasoning) {
     if (buffer.length > 512000 || data.length > 64) throw new PublicError(502, '模型流式响应格式无效。');
     if (done) break;
   }
-  if (!finishReason) throw new PublicError(502, '模型响应中断，请重试。');
-  if (calls.size) message.tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
+  if (!finishReason) throw new TransientModelError(502, '模型响应中断，请重试。');
+  if (calls.size) message.tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => {
+    if (Buffer.byteLength(call.function.arguments) > toolArgumentLimit(call.function.name)) {
+      call.argumentOverflow = true;
+      call.function.arguments = '{}';
+    }
+    return call;
+  });
   return { message, finishReason, usage };
 }
 
 async function readModelResponse(response, onReasoning) {
-  assertModelStatus(response.statusCode);
+  assertModelStatus(response.statusCode, response.headers['retry-after']);
   if (String(response.headers['content-type']).includes('text/event-stream')) {
     return readCompletionStream(response, onReasoning);
   }
@@ -153,6 +209,16 @@ export function isDeepSeek(config) {
   return config.platform || (config.baseUrl && new URL(config.baseUrl).hostname.toLowerCase().replace(/\.$/, '') === 'api.deepseek.com');
 }
 
+const builderDateFormat = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long'
+});
+
+function deepSeekChineseMessages(messages) {
+  const { year, month, day, weekday } = Object.fromEntries(builderDateFormat.formatToParts().map(({ type, value }) => [type, value]));
+  const reminder = { role: 'latest_reminder', content: `${year}-${month}-${day},${weekday},,Web,中文` };
+  return messages.flatMap((message) => message.role === 'user' ? [reminder, message] : [message]);
+}
+
 export async function chatCompletion(config, messages, maxTokens, options = {}) {
   const endpoint = parseEndpoint(config.baseUrl);
   if (!endpoint.pathname.endsWith('/chat/completions')) {
@@ -168,16 +234,20 @@ export async function chatCompletion(config, messages, maxTokens, options = {}) 
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
       lookup(host, { all: true }).then(resolve, reject);
     });
-  } catch {
-    throw new PublicError(502, signal.aborted ? '模型请求超时，请重试。' : '无法解析模型服务地址。');
+  } catch (error) {
+    options.signal?.throwIfAborted();
+    if (signal.aborted || error?.code === 'EAI_AGAIN') throw new TransientModelError(502, '模型请求超时或 DNS 暂不可用。');
+    throw new PublicError(502, '无法解析模型服务地址。');
   }
   if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
     throw new PublicError(400, '模型接口必须解析到公开 IP 地址。');
   }
   const pinned = addresses.find(({ family }) => family === 4) ?? addresses[0];
+  const useChineseMetadata = options.thinking && host.toLowerCase().replace(/\.$/, '') === 'api.deepseek.com' &&
+    ['deepseek-flash', 'deepseek-v4-pro'].includes(config.model);
   const payload = JSON.stringify({
     model: config.model,
-    messages,
+    messages: useChineseMetadata ? deepSeekChineseMessages(messages) : messages,
     max_tokens: maxTokens,
     ...(isDeepSeek(config) ? {
       thinking: { type: options.thinking ? 'enabled' : 'disabled' },
@@ -207,11 +277,12 @@ export async function chatCompletion(config, messages, maxTokens, options = {}) 
         response.destroy();
       });
     });
-    call.on('error', (error) => reject(new PublicError(502, error.name === 'AbortError' ? '模型请求超时，请重试。' : '模型服务不可达，请检查地址或网络。')));
+    call.on('error', (error) => reject(new TransientModelError(502,
+      error.name === 'AbortError' ? '模型请求超时，请重试。' : '与模型服务的连接中断。')));
     call.end(payload);
   }).catch((error) => {
     if (error instanceof PublicError) throw error;
-    throw new PublicError(502, signal.aborted ? '模型请求超时，请重试。' : '模型响应中断，请重试。');
+    throw new TransientModelError(502, signal.aborted ? '模型请求超时，请重试。' : '模型响应中断，请重试。');
   });
   if (result.finishReason === 'length' && !options.test) throw new ModelOutputLimitError();
   if (result.finishReason === 'content_filter') throw new PublicError(422, '模型服务未完成这次请求，请检查需求后重试。');

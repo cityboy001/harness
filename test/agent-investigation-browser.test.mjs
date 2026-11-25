@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildProject } from '../server/agent-workflow.mjs';
 import { previewTestActions } from '../server/generation-browser.mjs';
 import { browserTest } from '../server/browser-runner.mjs';
 
@@ -64,6 +63,27 @@ test('a visible-text assertion can find a visible match after a hidden duplicate
   assert.equal(result.status, 'passed', JSON.stringify(result.steps));
 });
 
+test('real preview inspects repeated card footers and continues to a scoped interaction', {
+  skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable', timeout: 12000
+}, async () => {
+  const cards = Array.from({ length: 8 }, (_, i) =>
+    `<article class="dish-card"><footer class="dish-foot"><button id="add-${i}">加购菜品 ${i}</button></footer></article>`).join('');
+  const result = await browserTest({
+    files: { 'index.html': cards, 'server.js': files['server.js'] },
+    actions: [
+      { action: 'inspect', selector: '.dish-card .dish-foot' },
+      { action: 'click', selector: '#add-0' },
+      { action: 'assert_count', selector: '.dish-card .dish-foot', minCount: 8 }
+    ]
+  }, { executablePath });
+  assert.equal(result.status, 'passed', JSON.stringify(result));
+  assert.equal(result.steps[0].matchCount, 8);
+  assert.match(result.steps[0].dom, /加购菜品 0/);
+  assert.match(result.steps[0].dom, /加购菜品 3/);
+  assert.doesNotMatch(result.steps[0].dom, /加购菜品 4/);
+  assert.equal(result.steps[0].controls.length, 8);
+});
+
 test('real preview accepts a rewritten static navigation selector after scoped interactions', {
   skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable', timeout: 12000
 }, async () => {
@@ -78,57 +98,17 @@ test('real preview accepts a rewritten static navigation selector after scoped i
   assert.equal(fixed.status, 'passed', JSON.stringify(fixed));
 });
 
-test('real Chromium evidence drives a scoped repair and replays the original create, list and edit scenario', {
-  skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable',
-  timeout: 20000
+test('the acceptance runner supports long suites and selects a native option by value', {
+  skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable', timeout: 12000
 }, async () => {
-  const checked = [];
-  const published = [];
-  const output = await buildProject({ platform: true }, '先测试药材新增、列表和编辑，确有问题则修复。',
-    files, async (_config, messages) => {
-      const instruction = messages[0].content;
-      if (instruction.startsWith('You are the central planning agent')) {
-        return '{"mode":"investigate","schemaVersion":2,"goal":"新增、列表、编辑","allowRepair":true}';
-      }
-      if (instruction.startsWith('You are the browser acceptance agent')) return JSON.stringify({ tests: actions });
-      if (instruction.startsWith('You are the central agent reviewing a real browser investigation')) {
-        const { failure } = JSON.parse(messages[1].content);
-        assert.equal(checked.length, 2, 'The current version must reproduce the defect before repair is planned');
-        assert.equal(failure.failedStep.number, 3);
-        assert.deepEqual(failure.api.slice(-2), [
-          { method: 'POST', path: '/api/herbs', status: 200, response: { type: 'object', keys: ['name', 'id'] } },
-          { method: 'GET', path: '/api/herbs', status: 200, response: { type: 'array', length: 1 } }
-        ]);
-        assert.doesNotMatch(JSON.stringify(failure.api), /测试药材/);
-        return JSON.stringify({ decision: 'repair', schemaVersion: 2, tasks: [{
-          id: 'decode-herbs', title: '修正药材响应解析', capability: 'edit_project', outputFormat: 'patch',
-          goal: 'Read the response payload directly.', dependsOn: [], evidence: [],
-          acceptance: 'Create and edit a single herb and show the saved data in the list.',
-          files: { read: [], write: ['app.js'] }
-        }] });
-      }
-      assert.match(instruction, /project editing worker/);
-      assert.equal(checked.length, 2);
-      if (messages.length === 2) return '{"read":["app.js"]}';
-      assert.ok(messages.some(({ role, content }) => role === 'user' && /return payload\.body/.test(content)));
-      return JSON.stringify({ edits: [{ path: 'app.js', before: 'return payload.body;', after: 'return payload;' }] });
-    }, {
-      maxTokens: 32000,
-      onCandidate: (candidate) => published.push(candidate),
-      async testBrowser(candidate, steps, signal) {
-        signal.throwIfAborted();
-        const result = await browserTest({ files: candidate, actions: steps }, { executablePath });
-        checked.push({ files: candidate, steps, result });
-        return result;
-      }
-    });
-
-  assert.deepEqual(checked.map(({ result }) => result.status), ['passed', 'failed', 'passed']);
-  assert.equal(checked[1].files, files);
-  assert.deepEqual(checked[1].steps, checked[2].steps);
-  assert.equal(published.length, 1);
-  assert.equal(output.files, published[0]);
-  assert.equal(output.files['server.js'], files['server.js']);
-  assert.equal(output.files['app.js'], files['app.js'].replace('return payload.body;', 'return payload;'));
-  assert.match(output.summary, /原始浏览器用例/);
+  const website = { ...files, 'index.html': `<select id="sort"><option value="asc">升序</option><option value="desc">降序</option></select>
+    <p id="result">第一项</p><script>document.querySelector('#sort').onchange = () => {
+      document.querySelector('#result').textContent = '最后一项';
+    };</script>` };
+  const tests = Array.from({ length: 22 }, () => ({ action: 'assert_count', selector: '#sort', minCount: 1 }));
+  tests.push({ action: 'select', selector: '#sort', value: 'desc' },
+    { action: 'assert_text', selector: '#result', value: '最后一项', exact: true });
+  const result = await browserTest({ files: website, actions: tests }, { executablePath });
+  assert.equal(result.status, 'passed', JSON.stringify(result.steps.at(-1)));
+  assert.equal(result.steps.length, 24);
 });

@@ -26,10 +26,27 @@ export interface Project { id: string; name: string; updated: number; revision: 
 export interface Model { id: string; name: string; model: string; source: 'platform' | 'custom' | 'demo'; available: boolean; baseUrl?: string }
 export type AgentRole = 'central' | 'frontend' | 'backend' | 'browser' | 'direct' | 'analyze' | 'read_project' | 'edit_project';
 export type AgentState = 'waiting' | 'running' | 'done' | 'failed';
+export type AcceptanceStatus = 'passed' | 'failed' | 'unverified' | 'not_run';
+interface LayoutMeasurement { value: number; width: number; height: number; page: string }
+export interface AcceptanceItem {
+  id: string;
+  requirement: string;
+  expected: string;
+  kind: 'primary' | 'regression';
+  status: AcceptanceStatus;
+  detail: string;
+  checks: {
+    number: number; action: string; selector?: string; scope?: string; reference?: string;
+    value?: string; minCount?: number; maxCount?: number; metric?: string; status: AcceptanceStatus; detail: string;
+    actual?: LayoutMeasurement; baseline?: LayoutMeasurement;
+  }[];
+}
 export type AgentEvent =
   | { kind: 'assign'; role: AgentRole; task: string; round: number; taskId?: string; title?: string; dependsOn?: string[] }
   | { kind: 'status'; role: AgentRole; state: AgentState; detail?: string; taskId?: string; title?: string }
-  | { kind: 'check'; role: 'browser'; state: 'done' | 'failed'; round: number; step?: number; action?: string; selector?: string; expected?: string; detail?: string };
+  | { kind: 'check'; role: 'browser'; state: 'done' | 'failed'; round: number; step?: number; action?: string; selector?: string; expected?: string; detail?: string; diagnostic?: boolean }
+  | { kind: 'activity'; taskId?: string; detail: string; decision?: string }
+  | { kind: 'acceptance'; taskId?: string; candidateDigest: string; round: number; items: AcceptanceItem[] };
 export interface Conversation { id: string; prompt: string; model_id: string; model_name: string; state: 'running' | 'failed' | 'complete' | 'stopped'; response: string | null; created: number; has_reasoning: 0 | 1; has_checkpoint?: 0 | 1; result_type: 'answer' | 'revision' | null; agent_progress: string | null; agent_events?: AgentEvent[] }
 export interface ProjectChat { id: string; title: string }
 export interface ProjectWorkspace {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import { buildWebsite, mergeWorkerChanges, validateProjectFiles } from '../server/generation.mjs';
-import { ModelOutputLimitError, readCompletionStream } from '../server/models.mjs';
+import { ModelOutputLimitError, PublicError, readCompletionStream, retryModelCompletion, TransientModelError } from '../server/models.mjs';
 
 const project = {
   'index.html': '<h1>Old title</h1>',
@@ -10,6 +10,42 @@ const project = {
   'unused.css': '/* A distinctive stylesheet */',
   'obsolete.js': '/* Remove this one */'
 };
+
+test('temporary model errors retry the same request, while cancellation and permanent errors stop', async () => {
+  const messages = [{ role: 'user', content: '原始输入' }];
+  const retries = [];
+  const reasoning = [];
+  let attempts = 0;
+  const complete = async (_config, request, _tokens, options) => {
+    assert.equal(request, messages);
+    if (++attempts === 1) {
+      options.onReasoning('第一轮输出');
+      throw new TransientModelError(502, '连接中断');
+    }
+    options.onReasoning('重试后完成');
+    return '完成';
+  };
+  assert.equal(await retryModelCompletion(complete, {}, messages, 1000, {
+    onReasoning: (chunk) => reasoning.push(chunk)
+  }, (attempt) => retries.push(attempt)), '完成');
+  assert.deepEqual(retries, [1]);
+  assert.match(reasoning.join(''), /第一轮输出.*重新尝试这一轮.*重试后完成/s);
+
+  let permanentAttempts = 0;
+  await assert.rejects(retryModelCompletion(async () => {
+    permanentAttempts++;
+    throw new PublicError(422, 'Key 无效');
+  }, {}, messages, 1000), /Key 无效/);
+  assert.equal(permanentAttempts, 1);
+
+  const controller = new AbortController();
+  let cancelledAttempts = 0;
+  await assert.rejects(retryModelCompletion(async () => {
+    cancelledAttempts++;
+    throw new TransientModelError(502, '连接中断');
+  }, {}, messages, 1000, { signal: controller.signal }, () => controller.abort()), { name: 'AbortError' });
+  assert.equal(cancelledAttempts, 1);
+});
 const patch = {
   summary: '更新标题并删除旧脚本。',
   changes: { 'index.html': '<h1>New title</h1>', 'obsolete.js': null, 'new.css': '.heading {color: red}' }
@@ -39,7 +75,7 @@ test('a worker can correct an ambiguous edit without starting another repair rou
     if (turn === 2) return '{"edits":[{"path":"nav.js","before":"0","after":"1"}]}';
     const feedback = messages.findLast(({ role }) => role === 'user').content;
     assert.match(feedback, /nav\.js.*出现多次/);
-    assert.match(feedback, /no edits were applied/);
+    assert.match(feedback, /修改尚未应用/);
     return '{"edits":[{"path":"nav.js","before":"const second = 0;","after":"const second = 1;"}]}';
   }, { maxTokens: 10000, worker: 'frontend', compact: true });
   assert.equal(turn, 3);
@@ -66,6 +102,8 @@ test('DeepSeek reads selected files, continues reasoning and merges only changes
   const result = await buildWebsite({ platform: true }, 'Change the title and remove the old script.', project, async (_config, messages, budget, options) => {
     assert.equal(options.thinking, true);
     assert.equal(options.stream, true);
+    assert.match(messages[0].content, /^语言要求：从第一句开始，用简体中文思考并输出 reasoning_content/);
+    assert.match(messages[0].content, /每轮调用工具前后的分析、判断和后续计划都用简体中文/);
     assert.equal(options.tools[0].function.name, 'read_files');
     assert.ok(messages[1].content.includes('unused.css'));
     assert.ok(!JSON.stringify(messages).includes(project['unused.css']));
@@ -229,7 +267,7 @@ test('repeat reads stop early and reserve a response for the final change', asyn
     }
     assert.equal(options.toolChoice, 'none');
     assert.equal(options.tools[0].function.name, 'read_files');
-    assert.match(messages.at(-1).content, /Return the required final JSON now/);
+    assert.match(messages.at(-1).content, /立即返回最终 JSON/);
     return { message: { content: JSON.stringify({ changes: { 'index.html': '<h1>Fixed</h1>' } }) } };
   }, { maxTokens: 32000 });
   assert.equal(turn, 4);
@@ -272,4 +310,113 @@ test('questions and empty changes return answers without browser validation', as
     async () => JSON.stringify({ summary: '这段代码已经处理空列表。', changes: {} }), options);
   assert.equal(unchanged.files, null);
   assert.match(unchanged.summary, /本次没有修改项目文件/);
+});
+
+
+test('direct answers can call the gVisor code tool with no project', async () => {
+  let executed = 0;
+  const result = await buildWebsite({ platform: true }, '算出结果', undefined, async (_config, messages, _limit, options) => {
+    if (messages.length === 2) {
+      assert.ok(options.tools.some(tool => tool.function.name === 'run_code'));
+      return { message: { tool_calls: [{ id: 'code-1', type: 'function',
+        function: { name: 'run_code', arguments: JSON.stringify({ source: 'console.log(6 * 7)' }) } }] } };
+    }
+    assert.equal(JSON.parse(messages.at(-1).content).output, '42');
+    return '{"answer":"42"}';
+  }, {
+    maxTokens: 32000,
+    async runCode(source, signal) {
+      assert.equal(source, 'console.log(6 * 7)');
+      assert.equal(signal.aborted, false);
+      executed++;
+      return { exitCode: 0, output: '42' };
+    }
+  });
+  assert.equal(executed, 1);
+  assert.deepEqual(result, { files: null, summary: '42' });
+});
+
+
+test('ReAct plans, reads, stages, tests and repairs a candidate using browser feedback', async () => {
+  const tools = [];
+  const staged = [];
+  const checked = [];
+  const events = [];
+  const first = '<h1>Incomplete</h1>';
+  const final = '<h1>Ready</h1>';
+  const config = { platform: true };
+  const commands = [
+    ['update_plan', { steps: ['Build the page', 'Check the title'] }],
+    ['stage_changes', { files: { ...project, 'index.html': first } }],
+    ['test_preview', { candidate: 'candidate-1', actions: [{ action: 'assert_text', value: 'Ready' }] }],
+    ['read_files', { candidate: 'candidate-1', paths: ['index.html'] }],
+    ['stage_changes', { base: 'candidate-1', edits: [{ path: 'index.html', before: first, after: final }] }],
+    ['test_preview', { candidate: 'candidate-2', actions: [{ action: 'assert_text', value: 'Ready' }] }]
+  ];
+  const result = await buildWebsite(config, 'Make the page say Ready', undefined, async (_, messages, _budget, options) => {
+    if (!tools.length) assert.ok(options.tools.some(t => t.function.name === 'stage_changes'));
+    const previous = messages.at(-1);
+    if (tools.length === 3) assert.equal(JSON.parse(previous.content).status, 'failed');
+    if (tools.length === 4) assert.equal(JSON.parse(previous.content).files[0].content, first);
+    if (tools.length === 6) {
+      assert.equal(JSON.parse(previous.content).status, 'passed');
+      return '{"summary":"标题已修改", "candidate":"candidate-2"}';
+    }
+    const [name, args] = commands[tools.length];
+    tools.push(name);
+    return { message: { tool_calls: [{ id: 'action-' + tools.length, type: 'function',
+      function: { name, arguments: JSON.stringify(args) } }] } };
+  }, {
+    react: true, maxTokens: 32000, requireBrowser: true,
+    onCandidate: files => staged.push(files['index.html']),
+    onActivity: item => events.push(item),
+    testBrowser(files) {
+      const html = files['index.html'];
+      checked.push(html);
+      const ok = html === final;
+      return { status: ok ? 'passed' : 'failed', steps: [{ action: 'assert_text', ok, error: ok ? undefined : '标题未出现' }] };
+    }
+  });
+  assert.deepEqual(checked, [first, final]);
+  assert.deepEqual(staged, [first, final, final]);
+  assert.equal(result.files['index.html'], final);
+  assert.deepEqual(events.map(e => e.detail), ['计划', '已保存候选 candidate-1', '浏览器检查未通过',
+    '已保存候选 candidate-2', '浏览器检查通过']);
+});
+
+test('ReAct accepts a streamed stage larger than 8 KiB and recovers from an oversized tool call', async () => {
+  const payload = JSON.stringify({ files: { ...project, 'index.html': '<!--' + '分类'.repeat(4500) + '--><h1>菜单</h1>' } });
+  const toolResponse = async (id, name, args) => {
+    const event = value => 'data: ' + JSON.stringify(value) + '\n\n';
+    const makeDelta = toolCall => event({ choices: [{ delta: { tool_calls: [{ index: 0, ...toolCall }] } }] });
+    const wire = [
+      makeDelta({ id, function: { name: name.slice(0, 5) } }),
+      makeDelta({ function: { name: name.slice(5), arguments: args.slice(0, 7000) } }),
+      makeDelta({ function: { arguments: args.slice(7000) } }),
+      event({ choices: [{ finish_reason: 'tool_calls', delta: {} }], usage: { completion_tokens: 200 } }),
+      'data: [DONE]\n\n'
+    ];
+    return readCompletionStream(Readable.from(wire));
+  };
+  const oversized = await toolResponse('too-large', 'stage_changes', JSON.stringify({ files: { 'index.html': '食'.repeat(45000) } }));
+  assert.equal(oversized.message.tool_calls[0].argumentOverflow, true);
+  assert.equal(oversized.message.tool_calls[0].function.arguments, '{}');
+  const valid = await toolResponse('valid', 'stage_changes', payload);
+  assert.equal(valid.message.tool_calls[0].function.arguments, payload);
+  assert.equal(valid.message.tool_calls[0].argumentOverflow, undefined);
+  let turn = 0;
+  let staged = 0;
+  const result = await buildWebsite({ platform: true }, '制作菜单页', undefined, async (_, messages) => {
+    if (++turn === 1) return oversized;
+    if (turn === 2) {
+      assert.match(JSON.parse(messages.at(-1).content).error, /参数超过大小上限/);
+      assert.equal(messages.at(-2).tool_calls[0].argumentOverflow, undefined);
+      assert.equal(staged, 0);
+      return valid;
+    }
+    const { candidate } = JSON.parse(messages.at(-1).content);
+    return JSON.stringify({ candidate, summary: '已保存菜单页' });
+  }, { react: true, maxTokens: 32000, onCandidate() { staged++; } });
+  assert.match(result.files['index.html'], /<h1>菜单<\/h1>/);
+  assert.equal(staged, 2);
 });

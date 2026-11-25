@@ -6,34 +6,34 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { createApp } from '../server/app.mjs';
+import { browserTest } from '../server/browser-runner.mjs';
 import { demoCompletion } from '../server/demo.mjs';
 import { isPublicAddress, parseEndpoint } from '../server/models.mjs';
 
 const origin = 'http://localhost:3000';
+const passed = (actions) => ({ status: 'passed', steps: actions.map(({ action }) => ({ action, ok: true })) });
 
 test('a failed browser check preserves a private candidate and resumes the same run after reopening SQLite', async (t) => {
   const data = await mkdtemp(join(tmpdir(), 'site-builder-resume-'));
   let app;
-  let planning = 0;
   let writes = 0;
   let checks = 0;
-  const actions = [{ action: 'click', selector: '#save' }, { action: 'assert_text', value: '测试候选' }];
   const config = {
     data, origin, deepseekKey: 'fixture', dailyUser: 1,
     async completion(_model, messages) {
-      if (messages[0].content.startsWith('You are the central planning agent')) {
-        planning++;
-        return JSON.stringify({ mode: 'team', frontend: 'Build the page.', backend: 'Provide a handler.', contract: 'Use #save.', tests: actions });
-      }
+      const continuing = messages[1].content.includes('上次保存的未发布候选');
+      if (continuing) return '{"changes":{},"summary":"继续使用已保存页面"}';
       writes++;
-      return messages[0].content.includes('frontend sub-agent')
-        ? '{"changes":{"index.html":"<button id=\\"save\\">测试候选</button>"}}'
-        : '{"changes":{"server.js":"function handle() { return {status: 200, body: {ok: true}}; }"}}';
+      return JSON.stringify({ files: {
+        'index.html': '<button id="save">测试候选</button>',
+        'server.js': 'function handle() { return {status: 200, body: {ok: true}}; }'
+      } });
     },
     testBrowser(files, steps) {
       assert.match(files['index.html'], /测试候选/);
-      assert.deepEqual(JSON.parse(JSON.stringify(steps)), actions);
-      return { status: ++checks === 1 ? 'unavailable' : 'passed' };
+      if (++checks === 1) return { status: 'unavailable' };
+      const executablePath = process.env.BUILDER_TEST_CHROMIUM;
+      return executablePath ? browserTest({ files, actions: steps }, { executablePath }) : passed(steps);
     }
   };
   t.after(async () => {
@@ -77,8 +77,7 @@ test('a failed browser check preserves a private candidate and resumes the same 
   assert.equal(completed.project.hasSavedDraft, false);
   assert.equal(completed.messages[0].has_checkpoint, 0);
   assert.equal(completed.messages.length, 1);
-  assert.equal(planning, 1);
-  assert.equal(writes, 2);
+  assert.equal(writes, 1);
   assert.equal(checks, 2);
 });
 
@@ -88,10 +87,8 @@ test('project chats isolate messages and planner context while sharing the curre
   const app = await createApp({
     data, origin, demo: true, deepseekKey: 'test',
     async completion(_model, messages) {
-      if (messages[0].content.startsWith('You are the central planning agent')) {
-        observed.push(JSON.parse(messages[1].content));
-        return '{"mode":"direct"}';
-      }
+      const memory = messages[1].content.split('项目记忆（对话数据）：\n')[1];
+      observed.push(memory ? JSON.parse(memory) : { recent: [] });
       return '{"answer":"收到。"}';
     }
   });
@@ -135,89 +132,13 @@ test('project chats isolate messages and planner context while sharing the curre
 
   const first = await generate('第一条独立消息', chat.id);
   assert.deepEqual(first.chats, [{ id: chat.id, title: '第一条独立消息' }]);
-  assert.deepEqual(observed[0].projectMemory.recent, []);
+  assert.deepEqual(observed[0].recent, []);
   const second = await generate('第二条独立消息', chat.id);
   assert.deepEqual(second.messages.map(({ prompt }) => prompt), ['第一条独立消息', '第二条独立消息']);
-  assert.deepEqual(observed[1].projectMemory.recent.map(({ request }) => request), ['第一条独立消息']);
+  assert.deepEqual(observed[1].recent.map(({ request }) => request), ['第一条独立消息']);
   const original = (await request('GET', project)).json();
   assert.deepEqual(original.messages.map(({ prompt }) => prompt), ['生成待办网站']);
   assert.equal(original.project.revision, second.project.revision);
-});
-
-test('retrying a failed team request gives the planner failure evidence and a fresh route choice', async (t) => {
-  const data = await mkdtemp(join(tmpdir(), 'site-builder-team-retry-'));
-  const prompt = '我要做一个后台药材商 进货 出货 药材管理 药方计价零售 订单管理 还有汇总界面的一个后台管理系统，请你先好好规划要做的功能 然后开始干活';
-  const tests = [{ action: 'click', selector: '#save' }, { action: 'assert_text', value: '测试药材' }];
-  let plans = 0;
-  let browserRuns = 0;
-  const app = await createApp({
-    data, origin, deepseekKey: 'test',
-    async completion(_model, messages) {
-      const instructions = messages[0].content;
-      if (instructions.startsWith('You are the central planning agent')) {
-        const context = JSON.parse(messages[1].content);
-        assert.equal(context.request, prompt);
-        assert.equal(context.teamRequired, false);
-        if (++plans === 2) {
-          assert.deepEqual(context.previousAttempt, { state: 'failed', response: '浏览器测试暂不可用，请稍后重试。' });
-          return '{"mode":"direct"}';
-        }
-        return JSON.stringify({ mode: 'team', frontend: 'Inventory, purchases, shipments, pricing, orders and dashboard.',
-          backend: 'Provide the required server entry.', contract: 'Use #save to add a record.', tests });
-      }
-      if (plans === 2) return JSON.stringify({ files: {
-        'index.html': '<button id="save">保存测试药材</button>',
-        'server.js': 'function handle(){return {status:404,body:null}}'
-      } });
-      if (instructions.includes('frontend sub-agent')) {
-        return '{"changes":{"index.html":"<button id=\\"save\\">保存</button>"}}';
-      }
-      assert.match(instructions, /backend sub-agent/);
-      return '{"changes":{"server.js":"function handle(){return {status:404,body:null}}"}}';
-    },
-    async testBrowser(candidate, actions) {
-      assert.match(candidate['index.html'], /id="save"/);
-      assert.deepEqual(JSON.parse(JSON.stringify(actions)), browserRuns === 0 ? tests : [{ action: 'inspect' }]);
-      return { status: ++browserRuns === 1 ? 'unavailable' : 'passed' };
-    }
-  });
-  t.after(async () => {
-    await app.close();
-    await rm(data, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  });
-  let cookie;
-  const request = (method, path, payload) => app.inject({
-    method, url: '/api/' + path, payload, headers: { origin, ...(cookie && { cookie }) }
-  });
-  const signup = await request('POST', 'register', { name: 'herb-owner', password: 'retry-test' });
-  cookie = signup.headers['set-cookie'].split(';')[0];
-  const projectId = (await request('POST', 'projects', { name: '药材管理' })).json().id;
-  const path = 'projects/' + projectId;
-  const start = async () => {
-    const response = await request('POST', path + '/generate', { prompt });
-    assert.equal(response.statusCode, 202, response.body);
-    return response.json().id;
-  };
-  async function finished(id) {
-    for (let attempt = 0; attempt < 100; attempt++) {
-      const project = (await request('GET', path)).json();
-      const message = project.messages.find((entry) => entry.id === id);
-      if (message && message.state !== 'running') return { message, project: project.project };
-      await delay(20);
-    }
-    assert.fail('Expected generation to finish');
-  }
-  const first = await finished(await start());
-  assert.equal(first.message.state, 'failed');
-  assert.equal(first.project.revision, null);
-  assert.ok(first.message.agent_events.some(({ kind, role }) => kind === 'assign' && role === 'frontend'));
-
-  const retried = await finished(await start());
-  assert.equal(retried.message.state, 'complete');
-  assert.ok(retried.project.revision);
-  assert.ok(retried.message.agent_events.some(({ role, state }) => role === 'direct' && state === 'done'));
-  assert.equal(plans, 2);
-  assert.equal(browserRuns, 2);
 });
 
 test('an unpublished first candidate can be privately previewed while browser acceptance runs', async (t) => {
@@ -225,17 +146,13 @@ test('an unpublished first candidate can be privately previewed while browser ac
   const release = Promise.withResolvers();
   const app = await createApp({
     data, origin, deepseekKey: 'test',
-    async completion(_model, messages) {
-      const instructions = messages[0].content;
-      if (instructions.startsWith('You are the central planning agent')) return JSON.stringify({
-        mode: 'team', frontend: 'Create UI.', backend: 'Create API.', contract: 'GET /api/check',
-        tests: [{ action: 'click', selector: 'button' }, { action: 'assert_text', value: 'Draft' }]
-      });
-      return instructions.includes('frontend sub-agent')
-        ? '{"changes":{"index.html":"<button>Draft</button>"}}'
-        : '{"changes":{"server.js":"function handle(){return {status:200,body:{working:true}}}"}}';
+    async completion() {
+      return JSON.stringify({ files: {
+        'index.html': '<button>Draft</button>',
+        'server.js': 'function handle(){return {status:200,body:{working:true}}}'
+      } });
     },
-    async testBrowser() { await release.promise; return { status: 'passed' }; }
+    async testBrowser(_files, actions) { await release.promise; return passed(actions); }
   });
   t.after(async () => {
     release.resolve();
@@ -285,13 +202,7 @@ test('the owner can stop an active browser acceptance without publishing its dra
   const browserCancelled = Promise.withResolvers();
   const app = await createApp({
     data, origin, demo: true, deepseekKey: 'test',
-    async completion(_model, messages) {
-      if (messages[0].content.startsWith('You are the central planning agent')) {
-        return JSON.stringify({
-          mode: 'team', frontend: 'Add a notice.', contract: 'Use the existing backend.',
-          tests: [{ action: 'click', selector: 'button' }, { action: 'assert_text', value: 'Notice' }]
-        });
-      }
+    async completion() {
       return '{"changes":{"notice.html":"<h1>Notice</h1>"}}';
     },
     async testBrowser(_files, _actions, signal) {
@@ -328,8 +239,7 @@ test('the owner can stop an active browser acceptance without publishing its dra
   const stop = path + '/messages/' + id + '/stop';
   assert.equal((await request('POST', stop, {}, outsider)).statusCode, 404);
   const active = (await get()).messages.find((entry) => entry.id === id);
-  assert.ok(active.agent_events.some((event) => event.kind === 'assign' && event.task === 'Add a notice.'));
-  assert.ok(active.agent_events.some((event) => event.kind === 'status' && event.role === 'browser' && event.state === 'running'));
+  assert.equal(active.agent_progress, '正在检查候选网站…');
   assert.equal((await request('POST', stop, {}, owner)).statusCode, 202);
   await browserCancelled.promise;
   const stopped = await finished(id);
@@ -350,8 +260,8 @@ test('complete build workflow, account boundaries and rollback', async (t) => {
     async completion(config, messages, limit, options) {
       wasCustom = config.key === 'example-secret';
       if (limit === 16) return 'OK';
-      if (messages[0].content.startsWith('You are the central planning agent')) return '{"mode":"direct"}';
-      const current = messages[1].content.split('\n')[1];
+      const input = messages[1].content.split('\n')[1];
+      const current = input.startsWith('{') ? JSON.parse(input).request : input;
       if (current === 'question only') return JSON.stringify({ answer: '待办数据存在项目 SQLite 中。' });
       if (config.platform) {
         assert.equal(limit, 32000);
@@ -368,7 +278,8 @@ test('complete build workflow, account boundaries and rollback', async (t) => {
         return JSON.stringify(result);
       }
       return demoCompletion(config, messages);
-    }
+    },
+    testBrowser(_files, actions) { return passed(actions); }
   });
   t.after(async () => {
     await app.close();

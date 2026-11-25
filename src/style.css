@@ -112,11 +112,13 @@ p { line-height: 1.6; }
 .generation-error p { display: flex; align-items: flex-start; gap: 7px; margin: 0; }
 .generation-error svg { flex-shrink: 0; }
 .generation-error .retry { margin-top: 4px; }
-.reasoning { margin: 7px 0; border: 1px solid var(--line); border-radius: 9px; background: var(--canvas); font-size: .85rem; }
-.reasoning summary { padding: 7px 9px; color: var(--muted); }
-.reasoning[open] summary { border-bottom: 1px solid var(--line); }
-.reasoning p { padding: 8px 9px; }
-.reasoning-text { max-height: 230px; overflow: auto; padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.agent-task-log { margin-top: 6px; min-width: 0; }
+.agent-task-log > summary { color: var(--muted); cursor: pointer; }
+.agent-activity { padding-inline-start: 20px; margin: 6px 0; overflow-wrap: anywhere; }
+.agent-activity li + li { margin-top: 5px; }
+.agent-activity strong { font-weight: 600; }
+.agent-history { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 230px; overflow: auto; }
+
 .agent-progress { margin: 8px 0; border: 1px solid var(--line); border-radius: 9px; font-size: .85rem; }
 .agent-progress summary { padding: 8px 10px; font-weight: 600; cursor: pointer; }
 .agent-progress-body { display: grid; gap: 10px; padding: 9px 10px; border-top: 1px solid var(--line); }

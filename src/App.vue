@@ -143,8 +143,8 @@ async function readReasoning(id: string) {
     readingReasoning.delete(id);
   }
 }
-function toggleReasoning(event: Event, item: Conversation) {
-  if (!(event.currentTarget as HTMLDetailsElement).open) {
+function toggleReasoning(open: boolean, item: Conversation) {
+  if (!open || item.agent_events?.some(event => event.kind === 'activity')) {
     expandedReasoning.delete(item.id);
     return;
   }
@@ -668,18 +668,15 @@ onUnmounted(() => {
                 <span class="meta">{{ item.model_name }} · {{ item.state === 'running' ? '处理中' : item.state === 'failed' ? '处理失败' : item.state === 'stopped' ? '已停止' : item.result_type === 'answer' ? '已回复' : '已生成' }}</span>
                 <div v-if="item.state === 'failed'" class="generation-error">
                   <p class="danger-text" role="alert"><CircleAlert :size="16" aria-hidden="true" /><span>{{ item.response }}</span></p>
-                  <button class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '从检查点继续' : '重试' }}</button>
+                  <button class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '继续修改候选' : '重试' }}</button>
                 </div>
-                <AgentProgress v-if="item.agent_events?.length" :events="item.agent_events" :state="item.state" />
-                <details v-if="item.has_reasoning" class="reasoning" @toggle="toggleReasoning($event, item)">
-                  <summary>模型思考<template v-if="item.state === 'running'"> · 更新中</template></summary>
-                  <p v-if="reasoningErrors[item.id]" class="error">{{ reasoningErrors[item.id] }}</p>
-                  <div v-else-if="reasoning[item.id]" class="reasoning-text">{{ reasoning[item.id] }}</div>
-                  <p v-else class="meta">正在读取思考内容…</p>
-                </details>
+                <AgentProgress v-if="item.agent_events?.length || item.has_reasoning"
+                  :events="item.agent_events ?? []" :state="item.state"
+                  :has-reasoning="Boolean(item.has_reasoning)" :reasoning="reasoning[item.id]"
+                  :reasoning-error="reasoningErrors[item.id]" @toggle-progress="toggleReasoning($event, item)" />
                 <p v-if="item.state === 'running'" class="in-progress"><LoaderCircle class="spin" :size="16" /> {{ item.agent_progress || '正在处理你的请求…' }}</p>
                 <p v-else-if="item.state !== 'failed'">{{ item.response }}</p>
-                <button v-if="item.state === 'stopped'" class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '从检查点继续' : '重试' }}</button>
+                <button v-if="item.state === 'stopped'" class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '继续修改候选' : '重试' }}</button>
               </div>
             </div>
           </div>

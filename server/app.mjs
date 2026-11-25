@@ -2,9 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Fastify, { LogController } from 'fastify';
-import { chatCompletion, isDeepSeek, parseEndpoint, PublicError } from './models.mjs';
-import { buildProject } from './agent-workflow.mjs';
-import { GenerationCheckpointer } from './generation-checkpoints.mjs';
+import { chatCompletion, isDeepSeek, parseEndpoint, PublicError, retryModelCompletion } from './models.mjs';
+import { buildWebsite } from './generation.mjs';
+import { makeCodeRunner } from './code-runner.mjs';
 import { loadProjectMemory } from './project-memory.mjs';
 import { makeBrowserTester } from './browser-tester.mjs';
 import { previewInput } from './preview-requests.mjs';
@@ -256,8 +256,8 @@ export async function createApp(config) {
     const activeGeneration = store.get("SELECT id, chat_id, agent_progress FROM messages WHERE project_id = ? AND state = 'running'", item.id) ?? null;
     const records = store.all(`SELECT messages.id, prompt, model_id, model_name, state, response, created, result_type, agent_progress, agent_events,
       message_reasoning.message_id IS NOT NULL AS has_reasoning,
-      EXISTS (SELECT 1 FROM generation_runs r JOIN generation_checkpoints c ON c.message_id = r.message_id
-        WHERE r.message_id = messages.id AND r.base_revision IS ? AND c.snapshot IS NOT NULL) AS has_checkpoint FROM messages
+      EXISTS (SELECT 1 FROM generation_runs r
+        WHERE r.message_id = messages.id AND r.base_revision IS ? AND r.draft_files IS NOT NULL) AS has_checkpoint FROM messages
       LEFT JOIN message_reasoning ON message_reasoning.message_id = messages.id
       WHERE project_id = ? AND chat_id IS ? ORDER BY created, messages.rowid`, item.active_revision, item.id, chat);
     return { project: projectView(item), chats, activeGeneration, messages: records.map(({ agent_events, ...record }) => ({
@@ -313,11 +313,11 @@ export async function createApp(config) {
     const item = ownedProject(request);
     const chat = projectChat(item.id, request.body?.chatId);
     const resumeId = request.body?.resumeMessageId == null ? null : field(request.body.resumeMessageId, '生成记录', 64);
-    const resume = resumeId && store.get(`SELECT m.*, r.base_revision FROM messages m JOIN generation_runs r ON r.message_id = m.id
+    const resume = resumeId && store.get(`SELECT m.*, r.base_revision, r.draft_files FROM messages m JOIN generation_runs r ON r.message_id = m.id
       WHERE m.id = ? AND m.project_id = ? AND m.chat_id IS ? AND m.state IN ('failed', 'stopped')
-      AND EXISTS (SELECT 1 FROM generation_checkpoints c WHERE c.message_id = m.id AND c.snapshot IS NOT NULL)`, resumeId, item.id, chat);
+      AND r.draft_files IS NOT NULL`, resumeId, item.id, chat);
     if (resumeId && (!resume || resume.base_revision !== item.active_revision)) {
-      throw new PublicError(409, '当前版本没有可继续的检查点。');
+      throw new PublicError(409, '当前版本没有可继续的候选。');
     }
     const prompt = resume ? resume.prompt : field(request.body?.prompt, '需求', 6000);
     const modelId = resume ? resume.model_id : field(request.body?.modelId ?? 'platform', '模型', 64);
@@ -327,7 +327,7 @@ export async function createApp(config) {
       if (store.get("SELECT id FROM messages WHERE project_id = ? AND state = 'running'", item.id)) throw new PublicError(409, '这个项目正在生成，请等待当前请求完成。');
       if (tasks.size >= (config.generationConcurrency ?? 4)) throw new PublicError(503, '生成任务较多，请稍后重试。');
       if (resume) {
-        store.run("UPDATE messages SET state = 'running', response = NULL, agent_progress = ? WHERE id = ?", '正在从检查点继续…', messageId);
+        store.run("UPDATE messages SET state = 'running', response = NULL, agent_events = NULL, agent_progress = ? WHERE id = ?", '正在继续修改候选…', messageId);
         store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
         return;
       }
@@ -348,7 +348,7 @@ export async function createApp(config) {
     const controller = new AbortController();
     const { signal } = controller;
     const task = (async () => {
-      const events = JSON.parse(resume?.agent_events ?? '[]');
+      const events = [];
       const draftController = new AbortController();
       const draftSignal = AbortSignal.any([signal, draftController.signal]);
       let draft;
@@ -381,6 +381,7 @@ export async function createApp(config) {
       };
       try {
         const prior = item.active_revision ? revision(item) : undefined;
+        const baseline = prior ? JSON.parse(prior.files) : undefined;
         const previousAttempt = resume ? { state: resume.state, response: resume.response } : modelId === 'demo' ? undefined : store.get(`
           SELECT state, substr(response, 1, 1200) AS response FROM messages
           WHERE project_id = ? AND chat_id IS ? AND prompt = ? AND state IN ('failed', 'stopped')
@@ -389,12 +390,16 @@ export async function createApp(config) {
           app.log.warn({ project: item.id, name: error.name, code: error.code }, 'Could not update project memory');
         }, signal, chat);
         signal.throwIfAborted();
-        const output = await buildProject(model, prompt, prior ? JSON.parse(prior.files) : undefined,
-          modelId === 'demo' ? demoCompletion : completion, {
-            memory, signal, previousAttempt, projectState: prior ? { revision: prior.id, version: prior.version } : null,
-            checkpointer: modelId === 'demo' ? undefined : new GenerationCheckpointer(store, messageId),
-            threadId: messageId, resume: Boolean(resume),
-            testBrowser,
+        const draftFiles = resume ? JSON.parse(resume.draft_files) : undefined;
+        const context = previousAttempt?.response
+          ? '\n\n上次执行结果（供参考）：' + previousAttempt.response.slice(0, 1200)
+          : '';
+        const request = prompt + (draftFiles ? '\n\n当前文件是上次保存的未发布候选。继续完成原需求；若已完成修改，提交空 changes 以重新检查该候选。' : '') + context;
+        const provider = modelId === 'demo' ? demoCompletion : (...args) => retryModelCompletion(completion, ...args);
+        const output = await buildWebsite(model, request, draftFiles ?? baseline, provider, {
+            memory, signal, react: true, runCode: makeCodeRunner(config.codeLauncher),
+            testBrowser, requireBrowser: Boolean(testBrowser) && modelId !== 'demo',
+            resumeDraft: Boolean(draftFiles), comparisonFiles: baseline ?? null,
             onCandidate(files) {
               if (draftSignal.aborted) return;
               const candidate = { id: id(), message_id: messageId, files: JSON.stringify(files) };
@@ -413,10 +418,10 @@ export async function createApp(config) {
               if (signal.aborted) return;
               store.run("UPDATE messages SET agent_progress = ? WHERE id = ? AND state = 'running'", stage || null, messageId);
             },
-            onAgentEvent(event) {
-              if (signal.aborted || events.length >= 1024) return;
-              events.push(event);
-              store.run("UPDATE messages SET agent_events = ? WHERE id = ? AND state = 'running'", JSON.stringify(events), messageId);
+            onActivity({ detail, decision }) {
+              if (signal.aborted || events.length >= 100) return;
+              events.push({ kind: 'activity', detail, decision: decision?.slice(0, 600) });
+              store.run('UPDATE messages SET agent_events = ? WHERE id = ?', JSON.stringify(events), messageId);
             },
             onReasoning(chunk) {
               if (signal.aborted || reasoningTruncated) return;
@@ -454,7 +459,7 @@ export async function createApp(config) {
         flushReasoning();
         if (signal.aborted) {
           store.run("UPDATE messages SET state = ?, agent_progress = NULL, response = ? WHERE id = ?",
-            closing ? 'failed' : 'stopped', closing ? '平台重启中断了生成，请从检查点继续。' : '已停止生成。', messageId);
+            closing ? 'failed' : 'stopped', closing ? '平台重启中断了生成。可继续修改已保存的候选。' : '已停止生成。', messageId);
           return;
         }
         if (!(error instanceof PublicError)) app.log.error({ project: item.id, code: error.code, name: error.name }, 'Generation failed');
@@ -620,7 +625,7 @@ export async function createApp(config) {
     limit('model-test:' + account.id, 8, 600000);
     const existing = request.body?.id ? modelRow(request.body.id, account.id) : undefined;
     const value = readModel(request.body, existing);
-    await completion({ ...value, key: value.key || store.decrypt(existing) }, [{ role: 'user', content: 'Reply OK.' }], 16, { test: true });
+    await completion({ ...value, key: value.key || store.decrypt(existing) }, [{ role: 'user', content: '只回复「连接成功」。' }], 16, { test: true });
     return { ok: true };
   });
   app.get(prefix + '/healthz', async () => ({ ok: true }));

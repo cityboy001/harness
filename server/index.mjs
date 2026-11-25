@@ -23,6 +23,7 @@ const app = await createApp({
   deepseekModel: env.DEEPSEEK_MODEL?.trim(),
   encryptionKey: env.CREDENTIAL_KEY,
   launcher: env.PREVIEW_LAUNCHER,
+  codeLauncher: env.CODE_LAUNCHER,
   browserLauncher: env.BROWSER_TEST_LAUNCHER,
   demo: env.BUILDER_DEMO === '1',
   maxTokens: number('MODEL_MAX_TOKENS', 10000),

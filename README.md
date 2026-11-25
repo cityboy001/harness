@@ -13,7 +13,7 @@
 
 首次生成返回完整站点，后续修改先向模型提供文件清单，再按需提供它请求的源码。平台校验新增、替换和删除的文件，合并成候选版本后交给沙箱。对话区可展开查看 DeepSeek 返回的思考文字，生成期间会持续更新。
 
-LangGraph 的主控 Agent 可以先查询项目状态、读取源码或在隔离预览中观察行为，再选择直接处理或拆分任务。每项任务声明能力、依赖、证据、输出格式、验收标准和文件范围。调度器按依赖和文件冲突决定哪些任务可以并行，并在候选版本上运行浏览器验收。修改网站或纠正验收用例共计最多 20 轮，每次运行最多 45 分钟。SQLite 按生成任务保存图检查点和最新候选文件。失败或中断后可以预览候选，或从检查点继续。验收通过后才激活正式版本。
+请求直接交给模型。DeepSeek 使用一轮轮工具调用来执行多步任务，可记录简短计划、读取源码、运行沙箱代码、保存候选和检查预览。模型根据结果修正候选或直接回答。候选通过已配置的浏览器检查后激活。失败时可以继续修改已保存的候选。
 
 每个项目的原始对话保存在 `messages`，移出最近四轮的内容会分批提炼到 `project_memory` 滚动摘要。主控 Agent 可以按短语或对话 ID 查同项目的原始记录。执行任务时，Worker 接收该任务引用的证据、依赖产出和共享接口。
 
@@ -34,3 +34,5 @@ DeepSeek 的单个生成任务默认使用 `DEEPSEEK_MAX_TOKENS=32000`，思考�
 设置 `BROWSER_TEST_LAUNCHER=/usr/local/sbin/ai-site-builder-browser-test` 可启用 DeepSeek 的浏览器测试工具。先用 `deploy/Dockerfile.browser` 构建 `ai-site-builder-browser:1`，再安装启动脚本和对应 sudoers 规则。每次测试都在禁网的临时 Chromium 容器中运行，使用独立的测试数据库。
 
 `ai-site-builder-backup.timer` 每天在 `/var/backups/ai-site-builder` 保存平台库、活动项目库和本地 Key 加密密钥的一致性备份，保留七天。恢复时先停止服务，并将选定快照恢复为 `/var/lib/ai-site-builder` 中的对应文件，设置所属用户为 `ai-site-builder`。如果用环境变量 `CREDENTIAL_KEY` 加密，恢复时应保留该环境变量。腾讯云 COS 异地备份需要另行配置。
+
+代码执行工具使用部署机已有的 ai-site-builder-preview:1 镜像。在 Linux 上以 root 安装 deploy/code-launcher 为 /usr/local/sbin/ai-site-builder-code（权限 0755），更新 deploy/sudoers 对应规则，在服务环境设置 CODE_LAUNCHER=/usr/local/sbin/ai-site-builder-code 并重启服务。工具在临时、禁网的 gVisor 容器中运行 JavaScript，通过标准输出返回结果。

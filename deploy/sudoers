@@ -1,2 +1,3 @@
 ai-site-builder ALL=(root) NOPASSWD: /usr/local/sbin/ai-site-builder-preview *
 ai-site-builder ALL=(root) NOPASSWD: /usr/local/sbin/ai-site-builder-browser-test ""
+ai-site-builder ALL=(root) NOPASSWD: /usr/local/sbin/ai-site-builder-code ""

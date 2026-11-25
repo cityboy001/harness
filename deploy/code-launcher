@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+[ "${SUDO_USER:-}" = ai-site-builder ]
+[ "$#" -eq 0 ]
+exec /usr/bin/docker --host unix:///var/run/docker.sock run --rm -i --init --pull=never \
+  --runtime=runsc --network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --user node --workdir /tmp --tmpfs /tmp:rw,nosuid,nodev,size=32m,mode=1777 \
+  --memory=384m --memory-swap=384m --cpus=1 --pids-limit=128 --log-driver=none \
+  --entrypoint /usr/bin/timeout ai-site-builder-preview:1 --kill-after=1 10 node --input-type=module -

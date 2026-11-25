@@ -4,6 +4,7 @@
 !server
 !server/guest.mjs
 !server/browser-runner.mjs
+!server/generation-browser.mjs
 !server/models.mjs
 !server/preview.mjs
 !server/preview-requests.mjs

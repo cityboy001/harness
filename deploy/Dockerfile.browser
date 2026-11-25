@@ -4,6 +4,6 @@ COPY --from=node24 /usr/local/bin/node /usr/local/bin/node
 WORKDIR /runner
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
-COPY server/browser-runner.mjs server/guest.mjs server/preview.mjs server/preview-requests.mjs server/models.mjs ./server/
+COPY server/browser-runner.mjs server/generation-browser.mjs server/guest.mjs server/preview.mjs server/preview-requests.mjs server/models.mjs ./server/
 COPY src/preview-document.js ./src/
 ENTRYPOINT ["node", "/runner/server/browser-runner.mjs"]

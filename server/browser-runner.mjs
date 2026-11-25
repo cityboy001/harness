@@ -6,11 +6,13 @@ import { chromium } from 'playwright-core';
 import { createPreviewDocument, previewSandbox, previewStorageUpdate } from '../src/preview-document.js';
 import { Guest } from './preview.mjs';
 import { previewInput } from './preview-requests.mjs';
+import { compareLayout, maxAcceptanceActions, previewActions, relativeLayout } from './generation-browser.mjs';
 
 const fixtureUrl = 'https://builder-preview.test/';
 const actionTimeout = 2200;
 const maxBody = 80000;
 const maxApiEntries = 12;
+const maxInspectSamples = 4;
 
 // This function is installed in the trusted parent page, never in the generated document.
 function mountFixture({ files, sandbox, srcdoc }) {
@@ -23,6 +25,8 @@ function mountFixture({ files, sandbox, srcdoc }) {
     activePort?.close();
     const frame = document.createElement('iframe');
     frame.id = 'preview';
+    frame.dataset.page = currentPage;
+    frame.dataset.search = currentSearch;
     frame.setAttribute('sandbox', sandbox);
     frame.referrerPolicy = 'no-referrer';
     frame.addEventListener('load', () => {
@@ -66,7 +70,9 @@ function mountFixture({ files, sandbox, srcdoc }) {
 }
 
 async function snapshot(target) {
-  return (await target.ariaSnapshot({ timeout: actionTimeout })).slice(0, 4500);
+  const aria = await target.ariaSnapshot({ timeout: actionTimeout });
+  return (aria.trim() ? aria : await target.evaluate((element) => (element.innerText ?? '').slice(0, 4500),
+    undefined, { timeout: actionTimeout })).slice(0, 4500);
 }
 
 async function visibleControls(scope) {
@@ -81,20 +87,80 @@ async function visibleControls(scope) {
     })));
 }
 
+async function measureLayout(frame, step) {
+  return frame.locator('html').evaluate(async (root, { scope, selector, reference, metric }) => {
+    const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    await nextFrame();
+    const unique = (parent, css, label) => {
+      const matches = parent.querySelectorAll(css);
+      if (matches.length !== 1) throw new Error(`${label} ${css} 匹配到 ${matches.length} 个元素，需要唯一匹配。`);
+      return matches[0];
+    };
+    const rect = (element, label) => {
+      const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      if (![left, top, right, bottom, width, height].every(Number.isFinite) || width <= 0 || height <= 0 ||
+          style.visibility !== 'visible' || style.display === 'none' || style.opacity === '0' ||
+          element.checkVisibility?.({ opacityProperty: true, visibilityProperty: true }) === false) {
+        throw new Error(`${label}没有可测量的可见边界。`);
+      }
+      return { left, top, right, bottom, width, height };
+    };
+    const container = unique(root.ownerDocument, scope, '组件容器');
+    const target = unique(container, selector, '目标');
+    const other = reference ? unique(container, reference, '参考元素') : null;
+    if (target === other) throw new Error('目标与参考元素必须不同。');
+    const read = () => [rect(container, '组件容器'), rect(target, '目标'), other ? rect(other, '参考元素') : null];
+    let previous = read();
+    let stable = false;
+    for (let sample = 0; sample < 12; sample++) {
+      await nextFrame();
+      const current = read();
+      stable = JSON.stringify(current) === JSON.stringify(previous);
+      previous = current;
+      if (stable) break;
+    }
+    if (!stable) throw new Error('元素边界仍在变化，无法取得稳定的布局测量。');
+    const [boundary, subject, referenceRect] = previous;
+    const anchor = referenceRect ?? boundary;
+    const values = {
+      leftInset: subject.left - boundary.left, rightInset: boundary.right - subject.right,
+      topInset: subject.top - boundary.top, bottomInset: boundary.bottom - subject.bottom,
+      horizontalGap: subject.left - anchor.right, verticalGap: subject.top - anchor.bottom,
+      leftAlignment: Math.abs(subject.left - anchor.left), rightAlignment: Math.abs(subject.right - anchor.right),
+      topAlignment: Math.abs(subject.top - anchor.top), bottomAlignment: Math.abs(subject.bottom - anchor.bottom),
+      centerXAlignment: Math.abs((subject.left + subject.right - anchor.left - anchor.right) / 2),
+      centerYAlignment: Math.abs((subject.top + subject.bottom - anchor.top - anchor.bottom) / 2)
+    };
+    return { value: values[metric], width: innerWidth, height: innerHeight, scrollX, scrollY,
+      target: subject, scope: boundary, ...(other && { reference: anchor }) };
+  }, step, { timeout: actionTimeout });
+}
+
 async function performAction(frame, step) {
   const target = step.selector ? frame.locator(step.selector) : frame.locator('body');
   const options = { timeout: actionTimeout };
   switch (step.action) {
-    case 'inspect':
+    case 'inspect': {
+      await target.first().waitFor({ ...options, state: 'attached' });
+      const matchCount = await target.count();
+      const sampleCount = Math.min(matchCount, maxInspectSamples);
+      const samples = await Promise.all(Array.from({ length: sampleCount }, async (_, index) =>
+        (await snapshot(target.nth(index))).slice(0, Math.floor(4500 / sampleCount))));
       return {
-        dom: await snapshot(target),
+        dom: samples.join('\n').slice(0, 4500),
+        matchCount,
         controls: await visibleControls(target)
       };
+    }
     case 'click':
       await target.click(options);
       break;
     case 'fill':
       await target.fill(step.value, options);
+      break;
+    case 'select':
+      await target.selectOption({ value: step.value }, options);
       break;
     case 'press':
       await target.press(step.value, options);
@@ -121,7 +187,7 @@ async function performAction(frame, step) {
       throw new Error(`滚动了 ${scrolls} 次，目标 ${step.selector} 仍未显示。`);
     }
     case 'assert_text':
-      await target.getByText(step.value, { exact: false }).filter({ visible: true }).first()
+      await target.getByText(step.value, { exact: step.exact ?? false }).filter({ visible: true }).first()
         .waitFor({ ...options, state: 'visible' });
       break;
     case 'assert_count': {
@@ -130,10 +196,12 @@ async function performAction(frame, step) {
       do {
         count = await target.evaluateAll((nodes) => nodes.filter((node) => node.getClientRects().length &&
           getComputedStyle(node).visibility === 'visible').length);
-        if (count >= step.minCount) return {};
+        if (count >= (step.minCount ?? 0) && count <= (step.maxCount ?? Infinity)) return { count };
         await new Promise((resolve) => setTimeout(resolve, 100));
       } while (Date.now() < deadline);
-      throw new Error(`预期至少 ${step.minCount} 个可见元素，实际匹配到 ${count} 个。`);
+      const expected = [step.minCount !== undefined && `至少 ${step.minCount}`,
+        step.maxCount !== undefined && `最多 ${step.maxCount}`].filter(Boolean).join('、');
+      throw new Error(`预期${expected}个可见元素，实际匹配到 ${count} 个。`);
     }
     default:
       throw new Error('Unsupported action');
@@ -142,6 +210,8 @@ async function performAction(frame, step) {
 }
 
 export async function browserTest({ files, actions }, { executablePath } = {}) {
+  actions = previewActions(actions, maxAcceptanceActions);
+  if (!actions) return { status: 'failed', error: '浏览器步骤不符合协议。', steps: [] };
   const directory = await mkdtemp(join(tmpdir(), 'builder-browser-'));
   const guest = new Guest(directory);
   let browser;
@@ -201,6 +271,20 @@ export async function browserTest({ files, actions }, { executablePath } = {}) {
     await frame.locator('html[data-builder-preview-ready]').waitFor({ state: 'attached', timeout: 3500 });
     for (const step of actions) {
       try {
+        if (step.action === 'assert_layout') {
+          const frameElement = page.locator('#preview');
+          const location = () => frameElement.evaluate(({ dataset }) => ({ page: dataset.page, search: dataset.search }));
+          const before = await location();
+          const geometry = await measureLayout(frame, step);
+          const after = await location();
+          if (before.page !== after.page || before.search !== after.search) throw new Error('测量时页面发生了跳转。');
+          const measurement = { ...geometry, ...after };
+          const verdict = relativeLayout(step) ? null : compareLayout(step, measurement);
+          steps.push({ action: step.action, ok: !verdict || verdict.status === 'passed', measurement,
+            ...(verdict?.status === 'failed' && { error: verdict.detail }) });
+          if (verdict && verdict.status !== 'passed') break;
+          continue;
+        }
         steps.push({ action: step.action, ok: true, ...await performAction(frame, step) });
       } catch (error) {
         const controls = await visibleControls(frame).catch(() => []);

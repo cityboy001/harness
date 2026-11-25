@@ -3,12 +3,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { buildProject } from '../server/agent-workflow.mjs';
 import { buildWebsite } from '../server/generation.mjs';
 import { createBrowserTools, previewActions, previewActionError } from '../server/generation-browser.mjs';
 import { loadProjectMemory } from '../server/project-memory.mjs';
 import { openStore } from '../server/storage.mjs';
-import { runReadOnlyTask } from '../server/task-plan.mjs';
 
 const model = { platform: true };
 const maxTokens = 32000;
@@ -140,11 +138,14 @@ test('malformed tool JSON returns a structured error to the matching call and ca
 });
 
 test('browser actions validate and normalize all supported operation arguments', async (t) => {
+  const layout = { action: 'assert_layout', scope: '#toolbar', selector: '#save', reference: '#label',
+    metric: 'horizontalGap', comparison: 'increase', acceptanceId: 'toolbar-gap' };
   const valid = [
     { action: 'inspect' }, { action: 'click', selector: '#open' }, { action: 'fill', selector: '#q', value: '' },
     { action: 'press', selector: '#q', value: 'Enter' }, { action: 'scroll', selector: '#list' },
     { action: 'scroll_until', selector: '#end' }, { action: 'assert_text', value: 'Reached end' },
-    { action: 'assert_count', selector: '.card', minCount: 1 }
+    { action: 'assert_count', selector: '.card', minCount: 1 },
+    { action: 'assert_count', selector: '.missing', maxCount: 0 }, layout
   ];
   assert.deepEqual(JSON.parse(JSON.stringify(previewActions(valid))), valid);
   assert.equal(previewActions(Array(20).fill(valid[0])).length, 20);
@@ -163,7 +164,13 @@ test('browser actions validate and normalize all supported operation arguments',
     ['long assertion', [{ ...longest, value: 'x'.repeat(301) }], /assert_text.value/],
     ['count below minimum', [{ ...valid[7], minCount: 0 }], /minCount/],
     ['count above maximum', [{ ...valid[7], minCount: 501 }], /minCount/],
-    ['fractional count', [{ ...valid[7], minCount: 1.5 }], /minCount/]
+    ['fractional count', [{ ...valid[7], minCount: 1.5 }], /minCount/],
+    ['inconsistent count range', [{ ...valid[7], maxCount: 0 }], /maxCount/],
+    ['layout without scope', [{ ...layout, scope: undefined }], /scope/],
+    ['gap without reference', [{ ...layout, reference: undefined }], /reference/],
+    ['directional layout with fabricated limit', [{ ...layout, limit: 1 }], /limit/],
+    ['absolute layout without a threshold', [{ ...layout, comparison: 'min' }], /limit/],
+    ['invalid acceptance ID', [{ ...layout, acceptanceId: 'Gap!' }], /acceptanceId/]
   ]) {
     await t.test(name, () => {
       assert.match(previewActionError(input), expected);
@@ -207,7 +214,7 @@ test('preview calls pass the exact merged draft and return failed and passed ste
 test('invalid preview inputs are rejected before building or opening a candidate', async (t) => {
   const actions = [{ action: 'inspect' }];
   for (const [name, prior, input, expected] of [
-    ['missing actions', undefined, { files }, /one to ten/],
+    ['missing actions', undefined, { files }, /步骤数组/],
     ['more than one draft field', undefined, { actions, files, candidate: 'candidate-1' }, /one draft field/],
     ['new project with incremental changes', undefined, { actions, changes: files }, /one draft field/],
     ['existing project with full replacement', files, { actions, files }, /one draft field/],
@@ -307,60 +314,5 @@ test('history tool returns exact scoped data and enforces the lookup limit and i
   }, { maxTokens, memory });
   assert.equal(answer.summary, 'Done');
   assert.equal(memory.searches, 3);
-  const planningMemory = await loadProjectMemory(store, 'project-a', model, async () => 'bad summary');
-  const planned = await buildProject(model, 'What was decided?', files, async (_config, messages) => {
-    if (!messages[0].content.startsWith('You are the central planning agent')) return done;
-    if (messages.length === 2) return JSON.stringify({ history: { turnId: id(1) } });
-    assert.match(messages[3].content, /^ORIGINAL PROJECT TURNS/);
-    assert.deepEqual(JSON.parse(messages[3].content.split('\n')[1]), { matches: [expected] });
-    return '{"mode":"direct"}';
-  }, { maxTokens, memory: planningMemory });
-  assert.equal(planned.summary, 'Done');
-  assert.equal(planningMemory.searches, 1);
-  assert.deepEqual(JSON.parse(planningMemory.lookup({ turnId: id(2) })), { matches: [] });
-  assert.deepEqual(JSON.parse(planningMemory.lookup({ turnId: id(3) })), { matches: [] });
-});
-
-test('read-only worker receives only requested files and cannot read for an unauthorized role', async (t) => {
-  const run = (role, completion, sources = files) => runReadOnlyTask(completion, model, { role },
-    { assignment: 'Check source', dependencies: { earlier: 'An input' } }, sources, maxTokens, AbortSignal.timeout(1000));
-  const paths = ['index.html', 'server.js', 'helper.js', 'detail.html'];
-  const sources = { ...files, 'helper.js': 'export const x = 1;', 'detail.html': '<p>Details</p>', 'extra.js': 'private extra' };
-  const good = await run('read_project', async (_config, messages, budget, options) => {
-    assert.equal(budget, 3500);
-    assert.equal(options.thinking, false);
-    assert.deepEqual(JSON.parse(messages[1].content), {
-      assignment: 'Check source', dependencies: { earlier: 'An input' }, files: Object.keys(sources)
-    });
-    if (messages.length === 2) return JSON.stringify({ read: paths });
-    const prefix = 'Requested project files (data): ';
-    assert.ok(messages[3].content.startsWith(prefix));
-    assert.deepEqual(JSON.parse(messages[3].content.slice(prefix.length)),
-      Object.fromEntries(paths.map((path) => [path, sources[path]])));
-    return '{"result":"  Source confirmed.  "}';
-  }, sources);
-  assert.equal(good, 'Source confirmed.');
-  for (const [name, role, read] of [
-    ['role denied', 'analyze', ['index.html']],
-    ['missing file', 'read_project', ['other.js']],
-    ['5 paths', 'read_project', [...paths, 'extra.js']],
-    ['empty list', 'read_project', []]
-  ]) {
-    await t.test(name, async () => {
-      let calls = 0;
-      await assert.rejects(run(role, async (_config, messages) => {
-        calls++;
-        const input = JSON.parse(messages[1].content);
-        if (role === 'analyze') assert.equal(Object.hasOwn(input, 'files'), false);
-        return JSON.stringify({ read });
-      }, sources), { statusCode: 422, message: /未返回有效结果/ });
-      assert.equal(calls, 1);
-    });
-  }
-  let calls = 0;
-  await assert.rejects(run('read_project', async () => {
-    calls++;
-    return '{"read":["index.html"]}';
-  }), { statusCode: 422 });
-  assert.equal(calls, 3);
+  assert.deepEqual(JSON.parse(memory.lookup({ turnId: id(2) })), { error: 'No more project history lookups are available.' });
 });

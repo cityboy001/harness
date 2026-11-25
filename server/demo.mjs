@@ -79,7 +79,7 @@ function handle(request) {
   return {status: 404, body: {error: '未找到接口'}};
 }`;
 export function demoCompletion(_config, messages) {
-  const revised = messages[0].content.includes('immutable current version');
+  const revised = messages[0].content.includes('清单列出当前不可变版本的文件。');
   const filters = revised ? '<div class="filters"><button data-filter="all" aria-pressed="true">全部</button><button data-filter="open">待完成</button><button data-filter="done">已完成</button></div>' : '';
   const page = '<html lang="zh-CN"><head><title>每日待办</title><link rel="stylesheet" href="style.css"></head><body><main><span class="label">待办清单</span><h1>每日待办</h1><form><input name="title" aria-label="新待办" placeholder="写下一件要做的事" required maxlength="120"><button>添加</button></form>' + filters + '<ul></ul><p id="empty" hidden>还没有待办。</p><p id="error" role="status"></p></main><script src="app.js"></script></body></html>';
   return JSON.stringify({
