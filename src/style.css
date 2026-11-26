@@ -206,33 +206,6 @@ p { line-height: 1.6; }
 .source-stage button { display: flex; justify-content: flex-start; max-width: 100%; white-space: normal; overflow-wrap: anywhere; text-align: left; }
 .source-stage pre { min-height: 430px; max-height: calc(100dvh - 165px); min-width: 0; margin: 0; overflow: auto; border: 1px solid var(--line); border-radius: 11px; padding: 15px; background: white; color: #263549; font-size: .85rem; line-height: 1.55; tab-size: 2; }
 
-.office-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--canvas); }
-.office-toolbar { min-height: 57px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--line); }
-.office-toolbar > div:first-child { display: grid; gap: 2px; }
-.office-actions { display: flex; align-items: center; gap: 7px; }
-.office-loading { flex: 1; display: grid; place-content: center; justify-items: center; gap: 8px; color: var(--muted); }
-.office-workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 210px minmax(0, 1fr); background: var(--canvas); }
-.office-outline { display: flex; flex-direction: column; gap: 8px; padding: 14px; background: var(--surface); border-right: 1px solid var(--line); }
-.office-outline > strong { margin-top: 5px; font-size: .86rem; }
-.office-outline button { justify-content: flex-start; overflow: hidden; text-overflow: ellipsis; }
-.office-canvas { min-width: 0; min-height: 0; overflow: auto; padding: 20px; display: grid; align-content: start; justify-items: center; gap: 14px; }
-.ppt-slide { width: min(100%, 720px); aspect-ratio: 16 / 9; display: grid; align-content: start; gap: 12px; padding: 7% 8%; background: white; border: 1px solid #dfe1ec; border-radius: 8px; box-shadow: 0 12px 32px #25233a12; }
-.ppt-slide input, .ppt-slide textarea { border: 0; resize: none; background: transparent; padding: 4px 0; }
-.ppt-title { font-size: clamp(1.25rem, 3vw, 2rem); font-weight: 750; }
-.ppt-subtitle { color: var(--muted); }
-.ppt-slide textarea { width: 100%; font-size: 1rem; line-height: 1.7; }
-.excel-sheet { width: min(100%, 900px); display: grid; gap: 10px; padding: 14px; background: white; border: 1px solid var(--line); border-radius: 10px; }
-.excel-sheet > input { max-width: 220px; font-weight: 700; }
-.excel-sheet table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-.excel-sheet th, .excel-sheet td { border: 1px solid #dde0e9; min-width: 120px; }
-.excel-sheet th input, .excel-sheet td input { width: 100%; border: 0; border-radius: 0; }
-.excel-sheet th input { background: var(--accent); color: white; font-weight: 700; }
-.word-page { width: min(100%, 720px); min-height: 760px; display: grid; align-content: start; gap: 12px; padding: 70px 65px; background: white; border: 1px solid #dfe1ec; box-shadow: 0 12px 32px #25233a12; }
-.word-title { border: 0; font-size: 1.6rem; font-weight: 750; padding: 4px 0; }
-.word-page textarea { border: 0; resize: vertical; line-height: 1.8; }
-.office-json { width: min(100%, 900px); justify-self: stretch; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); padding: 8px 10px; }
-.office-json textarea { width: 100%; margin-top: 8px; font-family: Consolas, monospace; font-size: .82rem; }
-
 .modal-overlay { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; z-index: 10; background: #201b3a62; }
 .dialog { width: min(100%, 440px); max-height: calc(100dvh - 32px); overflow: auto; padding: 20px; border-radius: 16px; background: white; display: grid; gap: 14px; box-shadow: 0 18px 55px #25193d38; }
 .model-dialog { width: min(100%, 530px); }

@@ -14,21 +14,14 @@ import { demoCompletion } from './demo.mjs';
 import { cleanReport, quickResearchReply, reportDocument, runResearchTurn } from './research.mjs';
 import { showReportCharts } from './report-charts.mjs';
 import { deepSeekWebTools } from './web-research.mjs';
-import { exportOfficeDocument } from './office-export.mjs';
 
 const id = () => randomUUID().replaceAll('-', '');
 const dayKey = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
 const sessionKey = (request) => cookieValue(request.headers.cookie);
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const assetTypes = { js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', svg: 'image/svg+xml' };
-const selectProjects = `SELECT projects.*, CASE
-  WHEN research_projects.project_id IS NOT NULL THEN 'research'
-  WHEN office_projects.project_id IS NOT NULL THEN office_projects.format
-  ELSE 'website'
-END AS kind
-  FROM projects
-  LEFT JOIN research_projects ON research_projects.project_id = projects.id
-  LEFT JOIN office_projects ON office_projects.project_id = projects.id`;
+const selectProjects = `SELECT projects.*, CASE WHEN research_projects.project_id IS NULL THEN 'website' ELSE 'research' END AS kind
+  FROM projects LEFT JOIN research_projects ON research_projects.project_id = projects.id`;
 
 function field(value, label, max, min = 1) {
   const result = typeof value === 'string' ? value.trim() : '';
@@ -289,63 +282,14 @@ export async function createApp(config) {
     const owner = user(request).id;
     const name = field(request.body?.name, '项目名称', 60);
     const kind = request.body?.kind ?? 'website';
-    if (!['website', 'research', 'ppt', 'excel', 'word'].includes(kind)) throw new PublicError(400, '项目类型无效。');
+    if (!['website', 'research'].includes(kind)) throw new PublicError(400, '项目类型无效。');
     if (store.get('SELECT count(*) AS count FROM projects WHERE user_id = ?', owner).count >= 30) throw new PublicError(409, '项目数量已达上限。');
     const item = { id: id(), name, kind, user_id: owner, updated: Date.now(), active_revision: null };
     store.transaction(() => {
       store.run('INSERT INTO projects VALUES (?, ?, ?, ?, NULL)', item.id, owner, name, item.updated);
       if (kind === 'research') store.run('INSERT INTO research_projects VALUES (?)', item.id);
-      if (['ppt', 'excel', 'word'].includes(kind)) store.run('INSERT INTO office_projects VALUES (?, ?)', item.id, kind);
     });
     return reply.code(201).send(projectView(item));
-  });
-  function officeDocument(item) {
-    const row = store.get('SELECT document, version, updated FROM office_documents WHERE project_id = ?', item.id);
-    if (row) return { document: JSON.parse(row.document), version: row.version, updated: row.updated };
-    const defaults = item.kind === 'ppt'
-      ? { type: 'ppt', title: item.name, slides: [{ title: item.name, subtitle: '演示文稿', bullets: ['在左侧对话中描述需求', '在右侧编辑幻灯片内容'] }] }
-      : item.kind === 'excel'
-      ? { type: 'excel', title: item.name, sheets: [{ name: 'Sheet1', headers: ['项目', '数值', '说明'], rows: [['示例', '0', '编辑或让 Agent 更新']] }] }
-      : { type: 'word', title: item.name, sections: [{ title: '摘要', paragraphs: ['在左侧对话中描述文档需求。'], table: null }] };
-    return { document: defaults, version: 1, updated: item.updated };
-  }
-  route('GET', '/projects/:id/office', async (request) => {
-    const item = ownedProject(request);
-    if (!['ppt', 'excel', 'word'].includes(item.kind)) throw new PublicError(400, '该项目不是 Office 文档。');
-    return officeDocument(item);
-  });
-  route('PUT', '/projects/:id/office', async (request) => {
-    const item = ownedProject(request);
-    if (!['ppt', 'excel', 'word'].includes(item.kind)) throw new PublicError(400, '该项目不是 Office 文档。');
-    const document = request.body?.document;
-    if (!document || typeof document !== 'object' || Array.isArray(document) || document.type !== item.kind) {
-      throw new PublicError(400, '文档结构无效。');
-    }
-    const serialized = JSON.stringify(document);
-    if (Buffer.byteLength(serialized, 'utf8') > 500000) throw new PublicError(413, '文档数据超过大小上限。');
-    const previous = store.get('SELECT version FROM office_documents WHERE project_id = ?', item.id);
-    const version = (previous?.version ?? 0) + 1;
-    store.transaction(() => {
-      store.run(`INSERT INTO office_documents (project_id, document, version, updated) VALUES (?, ?, ?, ?)
-        ON CONFLICT(project_id) DO UPDATE SET document = excluded.document, version = excluded.version, updated = excluded.updated`,
-        item.id, serialized, version, Date.now());
-      store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
-    });
-    return { document, version, updated: Date.now() };
-  });
-  route('GET', '/projects/:id/office/export', async (request, reply) => {
-    const item = ownedProject(request);
-    if (!['ppt', 'excel', 'word'].includes(item.kind)) throw new PublicError(400, '该项目不是 Office 文档。');
-    try {
-      const { document } = officeDocument(item);
-      const result = await exportOfficeDocument(document);
-      const fileName = encodeURIComponent(item.name).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16));
-      return reply.type(result.mime)
-        .header('Content-Disposition', `attachment; filename*=UTF-8''${fileName}.${result.extension}`)
-        .send(result.buffer);
-    } catch (error) {
-      throw error instanceof PublicError ? error : new PublicError(422, '导出文档失败，请检查文档结构。');
-    }
   });
   route('GET', '/projects/:id', async (request) => {
     const item = ownedProject(request);
@@ -571,14 +515,7 @@ export async function createApp(config) {
         const context = previousAttempt?.response
           ? '\n\n上次执行结果（供参考）：' + previousAttempt.response.slice(0, 1200)
           : '';
-        const officeInstruction = item.kind === 'ppt'
-          ? '\n\n【PPT 项目】生成必须包含 office.json，根对象格式为 {"type":"ppt","title":"文档标题","slides":[{"title":"幻灯片标题","subtitle":"副标题","bullets":["要点一","要点二"]}]}。同时保留可预览的 index.html、server.js；将幻灯片内容优先写入 office.json，不要把办公文档当作普通长网页。'
-          : item.kind === 'excel'
-          ? '\n\n【Excel 项目】生成必须包含 office.json，根对象格式为 {"type":"excel","title":"文档标题","sheets":[{"name":"工作表名","headers":["列名一","列名二"],"rows":[["数据一","数据二"]]}]}。同时保留可预览的 index.html、server.js；将表格数据优先写入 office.json。'
-          : item.kind === 'word'
-          ? '\n\n【Word 项目】生成必须包含 office.json，根对象格式为 {"type":"word","title":"文档标题","sections":[{"title":"章节标题","paragraphs":["正文段落"],"table":null}] }。同时保留可预览的 index.html、server.js；将章节和段落优先写入 office.json。'
-          : '';
-        const request = prompt + officeInstruction + (draftFiles ? '\n\n当前文件是上次保存的未发布候选。继续完成原需求；若已完成修改，提交空 changes 以重新检查该候选。' : '') + context;
+        const request = prompt + (draftFiles ? '\n\n当前文件是上次保存的未发布候选。继续完成原需求；若已完成修改，提交空 changes 以重新检查该候选。' : '') + context;
         let modelTurns = 0;
         const provider = modelId === 'demo' ? demoCompletion : (model, messages, maxTokens, options) => {
           const stage = ++modelTurns === 1 ? '正在等待模型返回首个结果…' : '正在等待模型返回下一步结果…';
@@ -660,19 +597,6 @@ export async function createApp(config) {
           }
           store.run('INSERT INTO revisions VALUES (?, ?, ?, ?)', next, item.id, (prior?.version ?? 0) + 1, JSON.stringify(output.files));
           store.run('UPDATE projects SET active_revision = ?, updated = ? WHERE id = ?', next, Date.now(), item.id);
-          if (['ppt', 'excel', 'word'].includes(item.kind) && typeof output.files['office.json'] === 'string') {
-            try {
-              const document = JSON.parse(output.files['office.json']);
-              if (document?.type === item.kind) {
-                const previous = store.get('SELECT version FROM office_documents WHERE project_id = ?', item.id);
-                store.run(`INSERT INTO office_documents (project_id, document, version, updated) VALUES (?, ?, ?, ?)
-                  ON CONFLICT(project_id) DO UPDATE SET document = excluded.document, version = excluded.version, updated = excluded.updated`,
-                  item.id, JSON.stringify(document), (previous?.version ?? 0) + 1, Date.now());
-              }
-            } catch {
-              app.log.warn({ project: item.id }, 'Could not import generated office JSON');
-            }
-          }
           store.run("UPDATE messages SET state = 'complete', result_type = 'revision', response = ?, agent_progress = NULL WHERE id = ?", output.summary, messageId);
           store.run('DELETE FROM generation_runs WHERE message_id = ?', messageId);
         }), signal, !previewClosed);
