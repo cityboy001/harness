@@ -9,6 +9,7 @@ import { ApiError, api, message, type Conversation, type Model, type Project, ty
 import PreviewFrame from './PreviewFrame.vue';
 import AgentProgress from './AgentProgress.vue';
 import ReportPane from './ReportPane.vue';
+import OfficePane from './OfficePane.vue';
 
 const conversationPane = ref<HTMLElement | null>(null);
 const conversationWidth = ref<number>();
@@ -820,6 +821,7 @@ onUnmounted(() => {
         @pointerup="endDividerDrag" @pointercancel="endDividerDrag" @lostpointercapture="endDividerDrag"
         @keydown="resizeDividerByKey"></div>
       <ReportPane v-if="research" :project-id="current.id" :report-id="reportId" />
+      <OfficePane v-else-if="office" :project-id="current.id" :kind="current.kind as 'ppt' | 'excel' | 'word'" />
       <section v-else class="result">
         <header class="pane-head result-head">
           <div class="tabs" aria-label="结果视图">

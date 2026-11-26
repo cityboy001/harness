@@ -14,6 +14,7 @@ import { demoCompletion } from './demo.mjs';
 import { cleanReport, quickResearchReply, reportDocument, runResearchTurn } from './research.mjs';
 import { showReportCharts } from './report-charts.mjs';
 import { deepSeekWebTools } from './web-research.mjs';
+import { exportOfficeDocument } from './office-export.mjs';
 
 const id = () => randomUUID().replaceAll('-', '');
 const dayKey = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
@@ -298,6 +299,54 @@ export async function createApp(config) {
     });
     return reply.code(201).send(projectView(item));
   });
+  function officeDocument(item) {
+    const row = store.get('SELECT document, version, updated FROM office_documents WHERE project_id = ?', item.id);
+    if (row) return { document: JSON.parse(row.document), version: row.version, updated: row.updated };
+    const defaults = item.kind === 'ppt'
+      ? { type: 'ppt', title: item.name, slides: [{ title: item.name, subtitle: '演示文稿', bullets: ['在左侧对话中描述需求', '在右侧编辑幻灯片内容'] }] }
+      : item.kind === 'excel'
+      ? { type: 'excel', title: item.name, sheets: [{ name: 'Sheet1', headers: ['项目', '数值', '说明'], rows: [['示例', '0', '编辑或让 Agent 更新']] }] }
+      : { type: 'word', title: item.name, sections: [{ title: '摘要', paragraphs: ['在左侧对话中描述文档需求。'], table: null }] };
+    return { document: defaults, version: 1, updated: item.updated };
+  }
+  route('GET', '/projects/:id/office', async (request) => {
+    const item = ownedProject(request);
+    if (!['ppt', 'excel', 'word'].includes(item.kind)) throw new PublicError(400, '该项目不是 Office 文档。');
+    return officeDocument(item);
+  });
+  route('PUT', '/projects/:id/office', async (request) => {
+    const item = ownedProject(request);
+    if (!['ppt', 'excel', 'word'].includes(item.kind)) throw new PublicError(400, '该项目不是 Office 文档。');
+    const document = request.body?.document;
+    if (!document || typeof document !== 'object' || Array.isArray(document) || document.type !== item.kind) {
+      throw new PublicError(400, '文档结构无效。');
+    }
+    const serialized = JSON.stringify(document);
+    if (Buffer.byteLength(serialized, 'utf8') > 500000) throw new PublicError(413, '文档数据超过大小上限。');
+    const previous = store.get('SELECT version FROM office_documents WHERE project_id = ?', item.id);
+    const version = (previous?.version ?? 0) + 1;
+    store.transaction(() => {
+      store.run(`INSERT INTO office_documents (project_id, document, version, updated) VALUES (?, ?, ?, ?)
+        ON CONFLICT(project_id) DO UPDATE SET document = excluded.document, version = excluded.version, updated = excluded.updated`,
+        item.id, serialized, version, Date.now());
+      store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+    });
+    return { document, version, updated: Date.now() };
+  });
+  route('GET', '/projects/:id/office/export', async (request, reply) => {
+    const item = ownedProject(request);
+    if (!['ppt', 'excel', 'word'].includes(item.kind)) throw new PublicError(400, '该项目不是 Office 文档。');
+    try {
+      const { document } = officeDocument(item);
+      const result = await exportOfficeDocument(document);
+      const fileName = encodeURIComponent(item.name).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16));
+      return reply.type(result.mime)
+        .header('Content-Disposition', `attachment; filename*=UTF-8''${fileName}.${result.extension}`)
+        .send(result.buffer);
+    } catch (error) {
+      throw error instanceof PublicError ? error : new PublicError(422, '导出文档失败，请检查文档结构。');
+    }
+  });
   route('GET', '/projects/:id', async (request) => {
     const item = ownedProject(request);
     const chat = projectChat(item.id, request.query.chat);
@@ -523,11 +572,11 @@ export async function createApp(config) {
           ? '\n\n上次执行结果（供参考）：' + previousAttempt.response.slice(0, 1200)
           : '';
         const officeInstruction = item.kind === 'ppt'
-          ? '\n\n【PPT 项目】请使用现有 Agent 和预览能力创建一份幻灯片式页面：每张幻灯片独立清晰，包含标题、正文、图表或可视化，提供上一页/下一页交互，并保持专业版式。'
+          ? '\n\n【PPT 项目】生成必须包含 office.json，根对象格式为 {"type":"ppt","title":"文档标题","slides":[{"title":"幻灯片标题","subtitle":"副标题","bullets":["要点一","要点二"]}]}。同时保留可预览的 index.html、server.js；将幻灯片内容优先写入 office.json，不要把办公文档当作普通长网页。'
           : item.kind === 'excel'
-          ? '\n\n【Excel 项目】请使用现有 Agent 和预览能力创建一个表格式工作区：包含清晰表头、结构化数据、筛选或汇总能力，并用专业版式展示公式结果和图表。'
+          ? '\n\n【Excel 项目】生成必须包含 office.json，根对象格式为 {"type":"excel","title":"文档标题","sheets":[{"name":"工作表名","headers":["列名一","列名二"],"rows":[["数据一","数据二"]]}]}。同时保留可预览的 index.html、server.js；将表格数据优先写入 office.json。'
           : item.kind === 'word'
-          ? '\n\n【Word 项目】请使用现有 Agent 和预览能力创建一个文档式工作区：包含封面、目录、章节标题、段落、表格和页眉页脚式排版，并保持可读的长文档版式。'
+          ? '\n\n【Word 项目】生成必须包含 office.json，根对象格式为 {"type":"word","title":"文档标题","sections":[{"title":"章节标题","paragraphs":["正文段落"],"table":null}] }。同时保留可预览的 index.html、server.js；将章节和段落优先写入 office.json。'
           : '';
         const request = prompt + officeInstruction + (draftFiles ? '\n\n当前文件是上次保存的未发布候选。继续完成原需求；若已完成修改，提交空 changes 以重新检查该候选。' : '') + context;
         let modelTurns = 0;
@@ -611,6 +660,19 @@ export async function createApp(config) {
           }
           store.run('INSERT INTO revisions VALUES (?, ?, ?, ?)', next, item.id, (prior?.version ?? 0) + 1, JSON.stringify(output.files));
           store.run('UPDATE projects SET active_revision = ?, updated = ? WHERE id = ?', next, Date.now(), item.id);
+          if (['ppt', 'excel', 'word'].includes(item.kind) && typeof output.files['office.json'] === 'string') {
+            try {
+              const document = JSON.parse(output.files['office.json']);
+              if (document?.type === item.kind) {
+                const previous = store.get('SELECT version FROM office_documents WHERE project_id = ?', item.id);
+                store.run(`INSERT INTO office_documents (project_id, document, version, updated) VALUES (?, ?, ?, ?)
+                  ON CONFLICT(project_id) DO UPDATE SET document = excluded.document, version = excluded.version, updated = excluded.updated`,
+                  item.id, JSON.stringify(document), (previous?.version ?? 0) + 1, Date.now());
+              }
+            } catch {
+              app.log.warn({ project: item.id }, 'Could not import generated office JSON');
+            }
+          }
           store.run("UPDATE messages SET state = 'complete', result_type = 'revision', response = ?, agent_progress = NULL WHERE id = ?", output.summary, messageId);
           store.run('DELETE FROM generation_runs WHERE message_id = ?', messageId);
         }), signal, !previewClosed);
