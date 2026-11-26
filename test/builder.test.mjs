@@ -13,6 +13,61 @@ import { isPublicAddress, parseEndpoint } from '../server/models.mjs';
 const origin = 'http://localhost:3000';
 const passed = (actions) => ({ status: 'passed', steps: actions.map(({ action }) => ({ action, ok: true })) });
 
+test('generation timeouts report the interrupted stage and preserve any saved candidate', async (t) => {
+  const data = await mkdtemp(join(tmpdir(), 'site-builder-timeout-'));
+  const app = await createApp({
+    data, origin, deepseekKey: 'fixture', generationTimeoutMs: 1000,
+    async completion(_model, messages, _maxTokens, { signal }) {
+      if (messages[1].content.startsWith('用户请求：\n等待模型')) await delay(10000, null, { signal });
+      return JSON.stringify({ files: {
+        'index.html': '<h1>可继续的候选</h1>',
+        'server.js': 'function handle() { return {status: 200, body: {ok: true}}; }'
+      } });
+    },
+    async testBrowser(_files, _actions, signal) {
+      await delay(10000, null, { signal });
+    }
+  });
+  t.after(async () => {
+    await app.close();
+    await rm(data, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+  let cookie;
+  const request = (method, path, payload) => app.inject({
+    method, url: '/api/' + path, payload, headers: { origin, ...(cookie && { cookie }) }
+  });
+  const signup = await request('POST', 'register', { name: 'timeout-owner', password: 'timeout-test' });
+  cookie = signup.headers['set-cookie'].split(';')[0];
+  const project = 'projects/' + (await request('POST', 'projects', { name: '超时测试' })).json().id;
+  async function waitForFailure(prompt) {
+    const started = await request('POST', project + '/generate', { prompt });
+    assert.equal(started.statusCode, 202, started.body);
+    for (let attempt = 0; attempt < 150; attempt++) {
+      const snapshot = (await request('GET', project)).json();
+      const message = snapshot.messages.find(({ id }) => id === started.json().id);
+      if (message?.state === 'failed') {
+        assert.match(message.response, /达到 1 秒总时限/);
+        assert.equal(snapshot.project.revision, null);
+        return message;
+      }
+      await delay(20);
+    }
+    assert.fail('Expected a generation timeout');
+  }
+
+  const waiting = await waitForFailure('等待模型');
+  assert.match(waiting.response, /等待模型返回首个结果.*\n本轮尚未保存候选文件/);
+  assert.ok(waiting.agent_events.some(({ detail }) => detail === '正在等待模型返回首个结果…'));
+  assert.equal(waiting.has_checkpoint, 0);
+
+  const checking = await waitForFailure('先保存候选再检查');
+  assert.match(checking.response, /正在检查候选网站.*\n已保存未发布的候选/);
+  assert.equal(checking.has_checkpoint, 1);
+  const preview = await request('POST', project + '/preview/start', { draft: true });
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.match((await request('GET', project + '/preview')).json().files['index.html'], /可继续的候选/);
+});
+
 test('a failed browser check preserves a private candidate and resumes the same run after reopening SQLite', async (t) => {
   const data = await mkdtemp(join(tmpdir(), 'site-builder-resume-'));
   let app;
@@ -73,6 +128,8 @@ test('a failed browser check preserves a private candidate and resumes the same 
   assert.equal(resumed.statusCode, 202, resumed.body);
   assert.equal(resumed.json().id, id);
   const completed = await waitFor('complete');
+  const review = completed.messages[0].agent_events.find(({ detail }) => detail === '正在检查候选网站…');
+  assert.match(review.details, /index\.html.*检查页面 · 通过/s);
   assert.ok(completed.project.revision);
   assert.equal(completed.project.hasSavedDraft, false);
   assert.equal(completed.messages[0].has_checkpoint, 0);

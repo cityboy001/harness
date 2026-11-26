@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
-  ArrowLeft, Blocks, Check, ChevronDown, CircleAlert, Code2, Ellipsis, FileCode2, FolderOpen, 
+  ArrowLeft, Blocks, Check, ChevronDown, CircleAlert, Code2, Ellipsis, FileCode2, FileText, FolderOpen,
   Copy, Globe2, Link2, LoaderCircle, LockKeyhole, LogOut, Monitor, Pencil, Play, Plus, RotateCw, Send, Settings2,
   Sparkles, Square, Trash2, X
 } from 'lucide-vue-next';
-import { ApiError, api, message, type Conversation, type Model, type Project, type ProjectChat, type ProjectWorkspace, type Revision, type SharedRevision, type ShareLink, type User } from './api';
+import { ApiError, api, message, type Conversation, type Model, type Project, type ProjectChat, type ProjectKind, type ProjectWorkspace, type Revision, type SharedRevision, type ShareLink, type User } from './api';
 import PreviewFrame from './PreviewFrame.vue';
 import AgentProgress from './AgentProgress.vue';
+import ReportPane from './ReportPane.vue';
 
 const conversationPane = ref<HTMLElement | null>(null);
 const conversationWidth = ref<number>();
@@ -87,6 +88,8 @@ const username = ref('');
 const password = ref('');
 const projects = ref<Project[]>([]);
 const current = ref<Project | null>(null);
+const reportId = ref('');
+const researchSearchAvailable = ref(false);
 const chats = ref<ProjectChat[]>([]);
 const selectedChat = ref('');
 const creatingChat = ref(false);
@@ -94,11 +97,6 @@ const loadingChat = ref(false);
 const activeGeneration = ref<ProjectWorkspace['activeGeneration']>(null);
 const chatDrafts = new Map<string, string>();
 const history = ref<Conversation[]>([]);
-const reasoning = ref<Record<string, string>>({});
-const reasoningErrors = ref<Record<string, string>>({});
-const expandedReasoning = new Set<string>();
-const readingReasoning = new Set<string>();
-const completedReasoning = new Set<string>();
 const models = ref<Model[]>([]);
 const platform = ref<Model | null>(null);
 const selectedModel = ref('platform');
@@ -118,6 +116,7 @@ const sending = ref(false);
 const stopping = ref(false);
 const name = ref('');
 const modal = ref<'create' | 'rename' | 'delete' | 'models' | 'share' | null>(null);
+const newProjectKind = ref<ProjectKind>('website');
 const modalError = ref('');
 const modelFeedback = ref('');
 const target = ref<Project | null>(null);
@@ -139,7 +138,11 @@ let renderToken = 0;
 const running = computed(() => Boolean(activeGeneration.value));
 const runningInAnotherChat = computed(() => activeGeneration.value !== null && (activeGeneration.value.chat_id ?? '') !== selectedChat.value);
 const customModels = computed(() => models.value.filter((model) => model.source === 'custom'));
-const activeModel = computed(() => models.value.find((model) => model.id === selectedModel.value) ?? platform.value);
+const research = computed(() => current.value?.kind === 'research');
+const websiteProjects = computed(() => projects.value.filter((item) => item.kind !== 'research'));
+const researchProjects = computed(() => projects.value.filter((item) => item.kind === 'research'));
+const workspaceModels = computed(() => research.value ? models.value.filter((model) => model.source !== 'demo') : models.value);
+const activeModel = computed(() => workspaceModels.value.find((model) => model.id === selectedModel.value) ?? platform.value);
 const fileNames = computed(() => Object.keys(source.value?.files ?? {}).sort());
 const demoModel = computed(() => models.value.find((model) => model.source === 'demo'));
 
@@ -161,18 +164,31 @@ function modelLabel(model: Model) {
 function scrollThread() {
   void nextTick(() => { if (thread.value) thread.value.scrollTop = thread.value.scrollHeight; });
 }
-function setUrl(id?: string, replace = false, chat = '') {
+function workspaceUrl(id?: string, chat = '', report = '') {
   const url = new URL(location.href);
   if (id) url.searchParams.set('project', id);
   else url.searchParams.delete('project');
   if (id && chat) url.searchParams.set('chat', chat);
   else url.searchParams.delete('chat');
+  if (id && report) url.searchParams.set('report', report);
+  else url.searchParams.delete('report');
+  return url;
+}
+function setUrl(id?: string, replace = false, chat = '', report = '') {
+  const url = workspaceUrl(id, chat, report);
   if (url.href !== location.href) window.history[replace ? 'replaceState' : 'pushState'](null, '', url);
+}
+function openReport(id: string) {
+  if (!current.value) return;
+  reportId.value = id;
+  setUrl(current.value.id, false, selectedChat.value, id);
+  void nextTick(() => document.getElementById('report-pane-heading')?.focus());
 }
 function resetWorkspace() {
   viewToken++;
   renderToken++;
   current.value = null;
+  reportId.value = '';
   selectedChat.value = '';
   chats.value = [];
   activeGeneration.value = null;
@@ -180,10 +196,6 @@ function resetWorkspace() {
   loadingChat.value = false;
   chatDrafts.clear();
   history.value = [];
-  reasoning.value = {};
-  reasoningErrors.value = {};
-  expandedReasoning.clear();
-  completedReasoning.clear();
   source.value = null;
   sourceFile.value = '';
   preview.value = null;
@@ -196,33 +208,6 @@ function resetWorkspace() {
   stopping.value = false;
   tab.value = 'preview';
 }
-async function readReasoning(id: string) {
-  const project = current.value?.id;
-  const token = viewToken;
-  if (!project || readingReasoning.has(id)) return;
-  readingReasoning.add(id);
-  try {
-    const result = await api<{ reasoning: string | null; state: Conversation['state'] }>('projects/' + project + '/messages/' + id + '/reasoning');
-    if (token === viewToken) {
-      reasoning.value[id] = result.reasoning ?? '';
-      if (result.state !== 'running') completedReasoning.add(id);
-      delete reasoningErrors.value[id];
-    }
-  } catch (error) {
-    if (token === viewToken) reasoningErrors.value[id] = message(error);
-  } finally {
-    readingReasoning.delete(id);
-  }
-}
-function toggleReasoning(open: boolean, item: Conversation) {
-  if (!open || item.agent_events?.some(event => event.kind === 'activity')) {
-    expandedReasoning.delete(item.id);
-    return;
-  }
-  expandedReasoning.add(item.id);
-  if (!completedReasoning.has(item.id)) void readReasoning(item.id);
-}
-
 async function initialize() {
   try {
     const snapshot = await api<{ user: User | null; platform: Model }>('session');
@@ -331,10 +316,14 @@ async function restoreRoute() {
   const route = new URL(location.href).searchParams;
   const id = route.get('project');
   const chat = route.get('chat') ?? '';
+  const report = route.get('report') ?? '';
   if (id && current.value?.id === id) {
     if (chat && !chats.value.some((item) => item.id === chat)) setUrl(id, true, selectedChat.value);
-    else await selectChat(chat, false);
-  } else if (id) await openProject(id, false, chat);
+    else {
+      await selectChat(chat, false);
+      showLinkedReport(report);
+    }
+  } else if (id) await openProject(id, false, chat, report);
   else {
     resetWorkspace();
     await loadProjects();
@@ -345,11 +334,16 @@ function workspaceData(id: string, chat: string) {
 }
 function updateWorkspace(result: ProjectWorkspace) {
   current.value = result.project;
+  researchSearchAvailable.value = result.researchSearchAvailable;
   chats.value = result.chats;
   activeGeneration.value = result.activeGeneration;
   history.value = result.messages;
 }
-async function openProject(id: string, updateUrl = true, chat = '') {
+function showLinkedReport(id: string) {
+  const reports = research.value ? history.value.filter(item => item.result_type === 'report') : [];
+  reportId.value = reports.find(item => item.id === id)?.id ?? reports.at(-1)?.id ?? '';
+}
+async function openProject(id: string, updateUrl = true, chat = '', report = '') {
   if (current.value?.id === id) return;
   resetWorkspace();
   pageError.value = '';
@@ -363,7 +357,9 @@ async function openProject(id: string, updateUrl = true, chat = '') {
     if (viewToken !== token || !user.value) return;
     selectedChat.value = chat;
     updateWorkspace(result);
-    setUrl(id, !updateUrl, chat);
+    if (research.value && selectedModel.value === 'demo') selectedModel.value = 'platform';
+    showLinkedReport(report);
+    setUrl(id, !updateUrl, chat, reportId.value);
     if (result.project.preview === 'running' || result.project.draftRevision) await loadPreview();
     scrollThread();
   } catch (error) {
@@ -377,9 +373,9 @@ async function selectChat(chat: string, updateUrl = true) {
   if (!id || selectedChat.value === chat) return;
   chatDrafts.set(selectedChat.value, prompt.value);
   selectedChat.value = chat;
+  reportId.value = '';
   prompt.value = chatDrafts.get(chat) ?? '';
   history.value = [];
-  expandedReasoning.clear();
   workspaceError.value = '';
   loadingChat.value = true;
   if (updateUrl) setUrl(id, false, chat);
@@ -425,7 +421,10 @@ async function refreshWorkspace(force = false) {
     const changedAgentEvents = result.messages.at(-1)?.agent_events?.length !== history.value.at(-1)?.agent_events?.length;
     const atBottom = thread.value && thread.value.scrollHeight - thread.value.scrollTop - thread.value.clientHeight < 36;
     updateWorkspace(result);
-    for (const id of expandedReasoning) if (!completedReasoning.has(id)) void readReasoning(id);
+    if (research.value && !reportId.value) {
+      showLinkedReport('');
+      if (reportId.value) setUrl(id, true, chat, reportId.value);
+    }
     if (changedHistory || (changedAgentEvents && atBottom)) scrollThread();
     if (changed || differentStatus || changedDraft) {
       if (result.project.preview === 'running' || result.project.draftRevision) await loadPreview();
@@ -505,11 +504,10 @@ async function generate(value = prompt.value, retryModel?: string, resumeMessage
   const chatId = selectedChat.value;
   sending.value = true;
   workspaceError.value = '';
-  const modelId = retryModel && models.value.some((model) => model.id === retryModel && model.available) ? retryModel : selectedModel.value;
+  const modelId = retryModel && workspaceModels.value.some((model) => model.id === retryModel && model.available) ? retryModel : activeModel.value?.id;
   try {
     await api('projects/' + current.value.id + '/generate', 'POST', { prompt: value.trim(), modelId, chatId: chatId || null, resumeMessageId });
     if (token !== viewToken) return;
-    if (resumeMessageId) completedReasoning.delete(resumeMessageId);
     if (!retryModel) {
       chatDrafts.delete(chatId);
       if (chatId === selectedChat.value) prompt.value = '';
@@ -542,10 +540,11 @@ function sample() {
   prompt.value = current.value?.revision ? '添加按完成状态筛选。' : '做一个待办网站，可以新增、编辑和完成任务，刷新后保留记录。';
 }
 
-function projectModal(kind: 'create' | 'rename' | 'delete', item?: Project) {
+function projectModal(kind: 'create' | 'rename' | 'delete', item?: Project, projectKind: ProjectKind = 'website') {
   modalError.value = '';
   modal.value = kind;
   target.value = item ?? null;
+  newProjectKind.value = projectKind;
   name.value = item?.name ?? '';
   if (kind !== 'delete') void nextTick(() => nameInput.value?.focus());
 }
@@ -568,7 +567,7 @@ async function saveProject() {
       if (current.value?.id === targetId) current.value = result;
       else await loadProjects();
     } else {
-      const result = await api<Project>('projects', 'POST', { name: name.value });
+      const result = await api<Project>('projects', 'POST', { name: name.value, kind: newProjectKind.value });
       await openProject(result.id);
     }
     modal.value = null;
@@ -647,7 +646,7 @@ onUnmounted(() => {
       <h1>无法打开分享预览</h1><p role="alert">{{ sharedError }}</p>
     </div>
   </main>
-  <div v-else class="app-shell" :class="{ 'has-workspace': current }">
+  <div v-else class="app-shell" :class="{ 'has-workspace': current, 'has-report-workspace': research }">
     <header class="topbar">
       <div v-if="current" class="breadcrumbs">
         <button class="quiet back" type="button" @click="back"><ArrowLeft :size="17" /> 我的项目</button>
@@ -699,32 +698,43 @@ onUnmounted(() => {
         <button class="primary" @click="projectModal('create')"><Plus :size="17" /> 新建项目</button>
       </div>
       <p v-if="pageError" class="error notice" role="alert">{{ pageError }}</p>
-      <div v-if="projects.length" class="project-list">
-        <article v-for="item in projects" :key="item.id" class="project-row">
-          <span class="project-icon"><Globe2 :size="20" /></span>
-          <button class="project-entry" @click="openProject(item.id)"><strong>{{ item.name }}</strong><span>{{ formatDate(item.updated) }} 更新</span></button>
-          <span class="status" :class="item.preview"><i></i>{{ stateLabel(item) }}</span>
-          <details class="menu row-menu">
-            <summary class="icon" :aria-label="item.name + ' 项目操作'"><Ellipsis :size="19" /></summary>
-            <div class="menu-items">
-              <button @click="projectModal('rename', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Pencil :size="15" /> 重命名</button>
-              <button class="danger-text" @click="projectModal('delete', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Trash2 :size="15" /> 删除项目</button>
-            </div>
-          </details>
-        </article>
-      </div>
-      <div v-else class="empty-projects">
-        <span class="large-icon"><FolderOpen :size="25" /></span>
-        <h2>还没有项目</h2><p>创建项目后，就可以描述你想做的网站。</p>
-        <button @click="projectModal('create')"><Plus :size="17" /> 新建项目</button>
-      </div>
+      <section v-for="group in [{ kind: 'website', items: websiteProjects }, { kind: 'research', items: researchProjects }]"
+        :key="group.kind" :class="{ 'research-projects': group.kind === 'research' }"
+        :aria-label="group.kind === 'research' ? '调研报告' : '网站项目'">
+        <header v-if="group.kind === 'research'" class="research-entry">
+          <span class="project-icon"><FileText :size="20" /></span>
+          <div><h2>调研报告</h2><p>联网查资料，在线编辑和导出报告。</p></div>
+          <button type="button" @click="projectModal('create', undefined, 'research')"><Plus :size="17" /> 新建调研</button>
+        </header>
+        <div v-if="group.items.length" class="project-list">
+          <article v-for="item in group.items" :key="item.id" class="project-row">
+            <span class="project-icon">
+              <FileText v-if="item.kind === 'research'" :size="20" /><Globe2 v-else :size="20" />
+            </span>
+            <button class="project-entry" @click="openProject(item.id)"><strong>{{ item.name }}</strong><span>{{ formatDate(item.updated) }} 更新</span></button>
+            <span v-if="item.kind !== 'research'" class="status" :class="item.preview"><i></i>{{ stateLabel(item) }}</span>
+            <details class="menu row-menu">
+              <summary class="icon" :aria-label="item.name + ' 项目操作'"><Ellipsis :size="19" /></summary>
+              <div class="menu-items">
+                <button @click="projectModal('rename', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Pencil :size="15" /> 重命名</button>
+                <button class="danger-text" @click="projectModal('delete', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Trash2 :size="15" /> 删除项目</button>
+              </div>
+            </details>
+          </article>
+        </div>
+        <div v-else-if="group.kind === 'website'" class="empty-projects">
+          <span class="large-icon"><FolderOpen :size="25" /></span>
+          <h2>还没有项目</h2><p>创建项目后，就可以描述你想做的网站。</p>
+          <button @click="projectModal('create')"><Plus :size="17" /> 新建项目</button>
+        </div>
+      </section>
     </main>
 
     <main v-else class="workspace" :class="{ 'resizing-workspace': draggingDivider }"
       :style="{ '--conversation-width': conversationWidth === undefined ? undefined : conversationWidth + 'px' }">
       <aside id="conversation-pane" ref="conversationPane" class="conversation">
         <header class="pane-head chat-head">
-          <strong>建站对话</strong>
+          <strong>{{ research ? '调研对话' : '建站对话' }}</strong>
           <select :value="selectedChat" aria-label="切换对话" @change="selectChat(($event.target as HTMLSelectElement).value)">
             <option value="">默认对话</option>
             <option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }}</option>
@@ -735,8 +745,8 @@ onUnmounted(() => {
           <p v-if="loadingChat" class="meta">正在加载对话…</p>
           <div v-else-if="!history.length" class="empty-thread">
             <span class="large-icon"><Sparkles :size="22" /></span>
-            <h2>{{ current.revision ? '这次想做什么？' : '你想做什么网站？' }}</h2>
-            <p>{{ current.revision ? '可以提问，也可以继续修改当前网站。' : '说说要实现的功能，生成后可以继续在这里修改。' }}</p>
+            <h2>{{ research ? '你想了解什么？' : current.revision ? '这次想做什么？' : '你想做什么网站？' }}</h2>
+            <p>{{ research ? '可以直接提问，也可以让助手调研并生成带来源的报告。' : current.revision ? '可以提问，也可以继续修改当前网站。' : '说说要实现的功能，生成后可以继续在这里修改。' }}</p>
           </div>
           <div v-for="item in history" :key="item.id" class="message-pair">
             <div class="user-message">{{ item.prompt }}</div>
@@ -744,16 +754,18 @@ onUnmounted(() => {
               <span class="ai-icon"><Sparkles :size="15" /></span>
               <div>
                 <span class="meta">{{ item.model_name }} · {{ item.state === 'running' ? '处理中' : item.state === 'failed' ? '处理失败' : item.state === 'stopped' ? '已停止' : item.result_type === 'answer' ? '已回复' : '已生成' }}</span>
+                <a v-if="item.result_type === 'report'" class="report-link"
+                  :href="workspaceUrl(current.id, selectedChat, item.id).href"
+                  :aria-current="reportId === item.id ? 'true' : undefined"
+                  @click.left.exact.prevent="openReport(item.id)"><FileText :size="16" /> 查看调研报告</a>
                 <div v-if="item.state === 'failed'" class="generation-error">
                   <p class="danger-text" role="alert"><CircleAlert :size="16" aria-hidden="true" /><span>{{ item.response }}</span></p>
                   <button class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '继续修改候选' : '重试' }}</button>
                 </div>
-                <AgentProgress v-if="item.agent_events?.length || item.has_reasoning"
-                  :events="item.agent_events ?? []" :state="item.state"
-                  :has-reasoning="Boolean(item.has_reasoning)" :reasoning="reasoning[item.id]"
-                  :reasoning-error="reasoningErrors[item.id]" @toggle-progress="toggleReasoning($event, item)" />
+                <AgentProgress v-if="item.agent_events?.length"
+                  :events="item.agent_events ?? []" :state="item.state" />
                 <p v-if="item.state === 'running'" class="in-progress"><LoaderCircle class="spin" :size="16" /> {{ item.agent_progress || '正在处理你的请求…' }}</p>
-                <p v-else-if="item.state !== 'failed'">{{ item.response }}</p>
+                <p v-else-if="item.state !== 'failed' && item.response">{{ item.response }}</p>
                 <button v-if="item.state === 'stopped'" class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '继续修改候选' : '重试' }}</button>
               </div>
             </div>
@@ -761,18 +773,22 @@ onUnmounted(() => {
         </div>
         <div class="editor-area">
           <div v-if="activeModel?.source === 'platform' && !activeModel.available" class="model-note">
-            <CircleAlert :size="15" /><span>平台 DeepSeek 尚未配置。<button class="link" @click="showModels">添加自己的 Key</button><template v-if="demoModel">，或<button class="link" @click="sample">试用待办演示</button>。</template></span>
+            <CircleAlert :size="15" /><span>平台 DeepSeek 尚未配置。<button class="link" @click="showModels">添加自己的 Key</button><template v-if="demoModel && !research">，或<button class="link" @click="sample">试用待办演示</button>。</template></span>
           </div>
           <div v-else-if="activeModel?.source === 'demo'" class="model-note">
             <CircleAlert :size="15" /><span>离线样例只生成待办网站。<button class="link" @click="sample">{{ current.revision ? '填入修改示例' : '填入需求示例' }}</button></span>
           </div>
+          <div v-else-if="research && !researchSearchAvailable" class="model-note">
+            <CircleAlert :size="15" /><span>网页搜索尚未配置，可提供公开 HTTPS 链接或 API 地址。</span>
+          </div>
           <p v-if="workspaceError || pollError" class="error" role="alert">{{ workspaceError || pollError }}</p>
           <form class="composer" @submit.prevent="generate()">
-            <textarea v-model="prompt" @keydown.enter="sendOnEnter" aria-label="建站需求" :placeholder="current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
+            <textarea v-model="prompt" @keydown.enter="sendOnEnter" :aria-label="research ? '调研主题' : '建站需求'"
+              :placeholder="research ? '提问、继续讨论，或要求生成调研报告…' : current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
             <div class="composer-actions">
               <div class="model-choice">
                 <select v-model="selectedModel" aria-label="调用模型">
-                  <option v-for="model in models" :key="model.id" :value="model.id">{{ modelLabel(model) }}</option>
+                  <option v-for="model in workspaceModels" :key="model.id" :value="model.id">{{ modelLabel(model) }}</option>
                 </select>
                 <button class="icon" aria-label="打开模型设置" type="button" @click="showModels"><Settings2 :size="17" /></button>
               </div>
@@ -789,7 +805,8 @@ onUnmounted(() => {
         :aria-valuenow="actualConversationWidth" @pointerdown="startDividerDrag" @pointermove="moveDivider"
         @pointerup="endDividerDrag" @pointercancel="endDividerDrag" @lostpointercapture="endDividerDrag"
         @keydown="resizeDividerByKey"></div>
-      <section class="result">
+      <ReportPane v-if="research" :project-id="current.id" :report-id="reportId" />
+      <section v-else class="result">
         <header class="pane-head result-head">
           <div class="tabs" aria-label="结果视图">
             <button :aria-pressed="tab === 'preview'" @click="setTab('preview')"><Monitor :size="17" /> 预览</button>
@@ -833,7 +850,7 @@ onUnmounted(() => {
   <div v-if="modal" class="modal-overlay" @click.self="closeModal" @keydown.esc="closeModal">
     <section class="dialog" :class="{ 'model-dialog': modal === 'models' }" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
       <header class="dialog-heading">
-        <h2 id="dialog-title">{{ { create: '新建项目', rename: '重命名项目', delete: '删除项目', models: '模型设置', share: '分享预览' }[modal] }}</h2>
+        <h2 id="dialog-title">{{ { create: newProjectKind === 'research' ? '新建调研' : '新建项目', rename: '重命名项目', delete: '删除项目', models: '模型设置', share: '分享预览' }[modal] }}</h2>
         <button class="icon" aria-label="关闭" @click="closeModal"><X :size="20" /></button>
       </header>
       <template v-if="modal === 'share'">
@@ -876,13 +893,13 @@ onUnmounted(() => {
         </form>
       </template>
       <form v-else class="stack" @submit.prevent="saveProject">
-        <p v-if="modal === 'delete'">确定删除「{{ target?.name }}」吗？该项目的对话、源码和预览数据将一起删除。</p>
-        <label v-else>项目名称<input ref="nameInput" v-model.trim="name" required maxlength="60" placeholder="例如：每日待办"></label>
+        <p v-if="modal === 'delete'">确定删除「{{ target?.name }}」吗？{{ target?.kind === 'research' ? '该项目的对话和报告将一起删除。' : '该项目的对话、源码和预览数据将一起删除。' }}</p>
+        <label v-else>项目名称<input ref="nameInput" v-model.trim="name" required maxlength="60" :placeholder="newProjectKind === 'research' ? '例如：行业趋势调研' : '例如：每日待办'"></label>
         <p v-if="modalError" class="error" role="alert">{{ modalError }}</p>
         <div class="dialog-actions">
           <button type="button" @click="closeModal">取消</button>
           <button v-if="modal === 'delete'" class="danger" :disabled="busy" type="submit">删除项目</button>
-          <button v-else class="primary" :disabled="busy" type="submit">{{ modal === 'create' ? '创建项目' : '保存' }}</button>
+          <button v-else class="primary" :disabled="busy" type="submit">{{ modal === 'create' ? newProjectKind === 'research' ? '创建调研' : '创建项目' : '保存' }}</button>
         </div>
       </form>
     </section>

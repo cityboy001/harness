@@ -2,12 +2,11 @@
 import { computed } from 'vue';
 import { Check, CircleAlert, LoaderCircle, Minus } from 'lucide-vue-next';
 import AgentAcceptance from './AgentAcceptance.vue';
+import AgentStep from './AgentStep.vue';
 import type { AgentEvent, AgentRole, AgentState, Conversation } from './api';
 
-const props = defineProps<{ events: AgentEvent[]; state: Conversation['state']; hasReasoning: boolean; reasoning?: string; reasoningError?: string }>();
-const emit = defineEmits<{ toggleProgress: [open: boolean] }>();
-const activities = computed(() => props.events.filter(event => event.kind === 'activity'));
-const showHistory = computed(() => props.hasReasoning && !activities.value.length);
+const props = defineProps<{ events: AgentEvent[]; state: Conversation['state'] }>();
+const activities = computed(() => props.events.filter(event => event.kind === 'activity' || event.kind === 'progress'));
 const roles: Record<AgentRole, string> = {
   central: '中央 Agent', frontend: '前端 Agent', backend: '后端 Agent', browser: '浏览器验收',
   direct: '单 Agent', analyze: '分析任务', read_project: '项目调查', edit_project: '项目修改'
@@ -22,7 +21,7 @@ const standaloneAcceptance = computed(() => acceptanceEvents.value.filter(event 
 const jobs = computed(() => {
   const active = new Map<string, { key: string; title: string; state: AgentState; task?: string; detail?: string; dependsOn?: string[] }>();
   for (const event of props.events) {
-    if (event.kind === 'acceptance' || event.kind === 'activity' || (event.kind === 'check' && event.diagnostic)) continue;
+    if (event.kind === 'acceptance' || event.kind === 'activity' || event.kind === 'progress' || (event.kind === 'check' && event.diagnostic)) continue;
     const key = event.kind === 'check' ? event.role : event.taskId ? 'task:' + event.taskId : event.role;
     const previous = active.get(key);
     const title = (event.kind === 'check' ? undefined : event.title) ?? previous?.title ?? roles[event.role];
@@ -52,8 +51,7 @@ const checkpoints = computed(() => props.events.filter(
 </script>
 
 <template>
-  <details class="agent-progress" :open="state === 'running' || state === 'failed'"
-    @toggle="emit('toggleProgress', ($event.currentTarget as HTMLDetailsElement).open)">
+  <details class="agent-progress" :open="state === 'running' || state === 'failed'">
     <summary>
       {{ tasks.length ? '任务清单' : 'Agent 进度' }}
       <span v-if="tasks.length" class="agent-tally">已完成 {{ completed }} / {{ tasks.length }}</span>
@@ -62,15 +60,9 @@ const checkpoints = computed(() => props.events.filter(
     <div class="agent-progress-body">
       <ol v-if="activities.some(event => !event.taskId)" class="agent-activity" aria-label="任务前后记录">
         <template v-for="(event, index) in activities" :key="index">
-          <li v-if="!event.taskId"><strong>{{ event.detail }}</strong><p v-if="event.decision">{{ event.decision }}</p></li>
+          <li v-if="!event.taskId"><AgentStep :title="event.detail" :details="event.details ?? event.decision" /></li>
         </template>
       </ol>
-      <div v-if="showHistory" class="agent-detail">
-        <p class="meta">历史处理记录</p>
-        <p v-if="reasoningError" class="error">{{ reasoningError }}</p>
-        <p v-else-if="reasoning" class="agent-history">{{ reasoning }}</p>
-        <p v-else class="meta">正在读取…</p>
-      </div>
       <ul v-if="phases.length" class="agent-jobs" aria-label="流程状态">
         <li v-for="job in phases" :key="job.key">
           <div class="agent-job-title">
@@ -100,8 +92,7 @@ const checkpoints = computed(() => props.events.filter(
               <summary>执行记录</summary>
               <ol v-if="job.activity.length" class="agent-activity">
                 <li v-for="(event, index) in job.activity" :key="index">
-                  <strong>{{ event.detail }}</strong>
-                  <p v-if="event.decision">{{ event.decision }}</p>
+                  <AgentStep :title="event.detail" :details="event.details ?? event.decision" />
                 </li>
               </ol>
               <AgentAcceptance v-for="(event, index) in job.acceptance" :key="index" :items="event.items" />

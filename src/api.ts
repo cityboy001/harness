@@ -22,7 +22,8 @@ export function message(error: unknown) {
 }
 
 export interface User { id: string; name: string }
-export interface Project { id: string; name: string; updated: number; revision: string | null; draftRevision?: string | null; hasSavedDraft?: boolean; preview: 'starting' | 'running' | 'stopped' }
+export type ProjectKind = 'website' | 'research';
+export interface Project { id: string; name: string; kind: ProjectKind; updated: number; revision: string | null; draftRevision?: string | null; hasSavedDraft?: boolean; preview: 'starting' | 'running' | 'stopped' }
 export interface Model { id: string; name: string; model: string; source: 'platform' | 'custom' | 'demo'; available: boolean; baseUrl?: string }
 export type AgentRole = 'central' | 'frontend' | 'backend' | 'browser' | 'direct' | 'analyze' | 'read_project' | 'edit_project';
 export type AgentState = 'waiting' | 'running' | 'done' | 'failed';
@@ -45,16 +46,19 @@ export type AgentEvent =
   | { kind: 'assign'; role: AgentRole; task: string; round: number; taskId?: string; title?: string; dependsOn?: string[] }
   | { kind: 'status'; role: AgentRole; state: AgentState; detail?: string; taskId?: string; title?: string }
   | { kind: 'check'; role: 'browser'; state: 'done' | 'failed'; round: number; step?: number; action?: string; selector?: string; expected?: string; detail?: string; diagnostic?: boolean }
-  | { kind: 'activity'; taskId?: string; detail: string; decision?: string }
+  | { kind: 'activity'; taskId?: string; detail: string; decision?: string; details?: string }
+  | { kind: 'progress'; detail: string; details?: string; taskId?: never; decision?: never }
   | { kind: 'acceptance'; taskId?: string; candidateDigest: string; round: number; items: AcceptanceItem[] };
-export interface Conversation { id: string; prompt: string; model_id: string; model_name: string; state: 'running' | 'failed' | 'complete' | 'stopped'; response: string | null; created: number; has_reasoning: 0 | 1; has_checkpoint?: 0 | 1; result_type: 'answer' | 'revision' | null; agent_progress: string | null; agent_events?: AgentEvent[] }
+export interface Conversation { id: string; prompt: string; model_id: string; model_name: string; state: 'running' | 'failed' | 'complete' | 'stopped'; response: string | null; created: number; has_reasoning: 0 | 1; has_checkpoint?: 0 | 1; result_type: 'answer' | 'revision' | 'report' | null; agent_progress: string | null; agent_events?: AgentEvent[] }
 export interface ProjectChat { id: string; title: string }
 export interface ProjectWorkspace {
   project: Project;
   chats: ProjectChat[];
   messages: Conversation[];
+  researchSearchAvailable: boolean;
   activeGeneration: { id: string; chat_id: string | null; agent_progress: string | null } | null;
 }
+export interface ResearchReport { html: string; version: number }
 export interface Revision { revision: string; version: number; files: Record<string, string> }
 export interface SharedRevision extends Revision { name: string }
 export interface ShareLink { url: string; expires: number; version: number; current: boolean }

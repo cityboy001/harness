@@ -15,6 +15,7 @@ export const layoutInstructions = `assert_layout 使用唯一 CSS selector 和 s
  Gap 和 Alignment 还需要唯一 reference。对比基线时用 increase、decrease、unchanged、not_increase 或 not_decrease，不填 limit。
  布局回归检查可用 unchanged 验证相同位置，或用 not_increase 验证 rightInset 没有增大。两者都允许基线和候选相等。
  已知尺寸可用 comparison 为 min、max 或 equals，并填写 limit（CSS px），equals 可按需填写 tolerance。
+ 仅在需求或已确认的布局约定有明确尺寸时使用布局断言。max 0 表示距离必须为 0 或负数，给容器内有留白的元素使用这一阈值会失败。
  只要求方向时使用基线对比，例如更靠右可用 leftInset increase 或 rightInset decrease。
  同一套步骤会在同样视口及全新数据中重放，确保两版的页面和准备状态等价。`;
 const keys = new Set(['Enter', 'Tab', 'Escape', 'Space', 'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight']);
@@ -45,6 +46,24 @@ export function normalizeBrowserContext(value, files) {
 }
 
 export class BrowserValidationError extends PublicError {}
+
+export function describeBrowserCheck(result, actions, launch) {
+  const names = { inspect: '检查页面', click: '点击', fill: '填写', select: '选择选项', press: '按键',
+    scroll: '滚动', scroll_until: '滚动到元素', assert_text: '检查文字', assert_count: '核对元素数量', assert_layout: '测量布局' };
+  const page = launch?.page ?? 'index.html';
+  const viewport = launch?.viewport;
+  const lines = [`页面 ${page}${viewport ? `（${viewport.width} × ${viewport.height}）` : ''}`];
+  for (const [index, step] of actions.entries()) {
+    const outcome = result.steps?.[index];
+    const target = step.selector ? ` ${step.selector}` : '';
+    const expected = step.action === 'assert_text' ? `「${step.value}」` : '';
+    const status = outcome ? (outcome.ok ? '通过' : '未通过') : '未执行';
+    lines.push(`${index + 1}. ${names[step.action]}${target}${expected} · ${status}${outcome?.error ? `。${outcome.error}` : ''}`);
+  }
+  if (result.error) lines.push(result.error);
+  if (result.errors?.length) lines.push(...result.errors);
+  return lines.join('\n');
+}
 
 export const browserTool = {
   type: 'function',
@@ -161,9 +180,12 @@ export function previewActionError(value, limit = maxActions) {
         !['assert_text', 'assert_count'].includes(step.action) || step.acceptanceId !== undefined)) {
       return `${label}只可把没有 acceptanceId 的文字或数量断言标为 precondition: true。`;
     }
+    if (step.action === 'assert_layout' && layoutMetrics.includes(step.metric) && !referenceMetrics.has(step.metric) && step.reference !== undefined) {
+      return `${label}的 ${step.metric} 以 scope 为参照，请省略 reference。`;
+    }
     if (step.action === 'assert_layout' && (!validSelector(step.scope) || !layoutMetrics.includes(step.metric) ||
         !layoutComparisons.includes(step.comparison) ||
-        (referenceMetrics.has(step.metric) ? !validSelector(step.reference) : step.reference !== undefined) ||
+        (referenceMetrics.has(step.metric) && !validSelector(step.reference)) ||
         (usesLayoutBaseline(step) ? step.limit !== undefined : !Number.isFinite(step.limit) || Math.abs(step.limit) > 10000) ||
         (step.tolerance !== undefined && (step.comparison !== 'equals' || !Number.isFinite(step.tolerance) ||
           step.tolerance < 0 || step.tolerance > 100)))) {
@@ -206,7 +228,9 @@ export function compareLayout(step, actual, baseline) {
     not_increase: '应小于或等于基线', not_decrease: '应大于或等于基线', min: `应至少为 ${step.limit} px`,
     max: `应至多为 ${step.limit} px`, equals: `应为 ${step.limit} px（容差 ${step.tolerance ?? 0} px）`
   })[step.comparison];
-  return { status: ok ? 'passed' : 'failed', detail: `${expectation}，实测${ok ? '符合' : '未达到'}预期。` };
+  const context = `${actual.page}（${actual.width} × ${actual.height}）中 ${step.selector} 的 ${step.metric}，` +
+    `参照 ${step.reference ?? step.scope}，实测 ${value} px`;
+  return { status: ok ? 'passed' : 'failed', detail: `${context}${relativeLayout(step) ? `，基线 ${from} px` : ''}，${expectation}。` };
 }
 
 const sameFiles = (left, right) => Object.keys(left).length === Object.keys(right).length &&
@@ -284,7 +308,7 @@ export function createBrowserTools(testBrowser, prior, buildDraft, signal, stage
         }
         result = { ...result, steps, status: steps.every(({ ok }) => ok) ? 'passed' : 'failed' };
       }
-      tests.push({ files, result, actions });
+      tests.push({ files, result, actions, launch });
       if (candidate && result.status === 'passed' &&
           actions.some(({ action }) => action.startsWith('assert_'))) {
         verifiedFiles = files;
@@ -297,7 +321,7 @@ export function createBrowserTools(testBrowser, prior, buildDraft, signal, stage
       return { files: verifiedFiles, summary: stageOnly ? '模型输出达到上限，已保留待验收的候选版本。'
         : '候选版本已通过浏览器验收。模型在生成最终回复时达到输出上限，已保留验收通过的版本。' };
     },
-    async finish(candidate, draft) {
+    async finish(candidate, draft, onCheck) {
       const files = candidate === undefined ? draft.files : candidates.get(candidate);
       if (!files) throw new PublicError(422, '模型选中的浏览器测试版本不存在，请重试。');
       if (stageOnly) return { files, summary: draft.summary };
@@ -306,11 +330,12 @@ export function createBrowserTools(testBrowser, prior, buildDraft, signal, stage
       const previous = tests.findLast((entry) => sameFiles(entry.files, files));
       const actions = previous?.actions ?? [{ action: 'inspect' }];
       const result = previous?.result ?? await testBrowser(files, actions, signal);
+      onCheck?.((previous ? '采用已执行的候选测试结果。\n' : '') + describeBrowserCheck(result, actions, previous?.launch));
       if (result.status === 'unavailable' && requireBrowser) throw new PublicError(503, '浏览器暂不可用，已保留候选。');
       if (result.status === 'failed') {
         const detail = result.steps?.find((step) => !step.ok)?.error || result.error || result.errors?.[0];
-        const error = new BrowserValidationError(422, (prior ? '浏览器验证失败，已保留上一版。' : '浏览器验证失败，请调整需求后重试。') +
-          (detail ? '\n' + detail : ''));
+        const error = new BrowserValidationError(422, (prior ? '浏览器验证失败，已保留上一版。' : '浏览器验证失败，已保留候选。') +
+          (detail ? '\n' + detail : '') + (attempts >= browserTestLimit ? '\n本轮浏览器测试次数已用完，可继续修改候选后复测。' : ''));
         error.verification = { result, actions };
         throw error;
       }

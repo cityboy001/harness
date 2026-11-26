@@ -196,10 +196,30 @@ async function performAction(frame, step) {
       if (await target.first().isVisible()) return {};
       throw new Error(`滚动了 ${scrolls} 次，目标 ${step.selector} 仍未显示。`);
     }
-    case 'assert_text':
-      await target.getByText(step.value, { exact: step.exact ?? false }).filter({ visible: true }).first()
-        .waitFor({ ...options, state: 'visible' });
-      break;
+    case 'assert_text': {
+      const descendant = target.getByText(step.value, { exact: step.exact ?? false }).filter({ visible: true }).first();
+      if (!step.selector) {
+        await descendant.waitFor({ ...options, state: 'visible' });
+        break;
+      }
+      const deadline = Date.now() + actionTimeout;
+      let sample = '';
+      do {
+        const result = await target.evaluateAll((nodes, { value, exact }) => {
+          const normalize = (text) => text.replace(/\s+/gu, ' ').trim();
+          const expected = normalize(value);
+          const visible = nodes.filter((node) => node.getClientRects().length && getComputedStyle(node).visibility === 'visible');
+          const texts = visible.map((node) => normalize(node.innerText ?? ''));
+          return { matched: texts.some((text) => exact ? text === expected : text.toLowerCase().includes(expected.toLowerCase())),
+            sample: texts[0]?.slice(0, 250) };
+        }, { value: step.value, exact: step.exact });
+        if (result.matched || (step.exact && await descendant.isVisible())) return {};
+        sample = result.sample ?? '';
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } while (Date.now() < deadline);
+      throw new Error(`在 ${step.selector} 未找到匹配的可见文字 ${JSON.stringify(step.value)}。` +
+        (sample ? ` 目标可见文字样本 ${JSON.stringify(sample)}。` : ''));
+    }
     case 'assert_count': {
       const deadline = Date.now() + actionTimeout;
       let count;

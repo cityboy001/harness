@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Fastify, { LogController } from 'fastify';
 import { chatCompletion, isDeepSeek, parseEndpoint, PublicError, retryModelCompletion } from './models.mjs';
-import { buildWebsite } from './generation.mjs';
+import { buildWebsite, GenerationTimeoutError } from './generation.mjs';
 import { makeCodeRunner } from './code-runner.mjs';
 import { loadProjectMemory } from './project-memory.mjs';
 import { makeBrowserTester } from './browser-tester.mjs';
@@ -11,12 +11,17 @@ import { previewInput } from './preview-requests.mjs';
 import { checkPassword, cookieValue, hashPassword, openStore, sessionLifetime, token } from './storage.mjs';
 import { makePreviews } from './preview.mjs';
 import { demoCompletion } from './demo.mjs';
+import { cleanReport, quickResearchReply, reportDocument, runResearchTurn } from './research.mjs';
+import { showReportCharts } from './report-charts.mjs';
+import { deepSeekWebTools } from './web-research.mjs';
 
 const id = () => randomUUID().replaceAll('-', '');
 const dayKey = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
 const sessionKey = (request) => cookieValue(request.headers.cookie);
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const assetTypes = { js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', svg: 'image/svg+xml' };
+const selectProjects = `SELECT projects.*, CASE WHEN research_projects.project_id IS NULL THEN 'website' ELSE 'research' END AS kind
+  FROM projects LEFT JOIN research_projects ON research_projects.project_id = projects.id`;
 
 function field(value, label, max, min = 1) {
   const result = typeof value === 'string' ? value.trim() : '';
@@ -86,7 +91,7 @@ export async function createApp(config) {
     return account;
   }
   function project(projectId, owner) {
-    const found = store.get('SELECT * FROM projects WHERE id = ? AND user_id = ?', projectId, owner);
+    const found = store.get(selectProjects + ' WHERE projects.id = ? AND user_id = ?', projectId, owner);
     if (!found) throw new PublicError(404, '项目不存在。');
     return found;
   }
@@ -134,7 +139,7 @@ export async function createApp(config) {
   }, 60000);
   expiryTimer.unref();
   const projectView = (item) => ({
-    id: item.id, name: item.name, updated: item.updated, revision: item.active_revision, preview: preview.status(item.id),
+    id: item.id, name: item.name, kind: item.kind, updated: item.updated, revision: item.active_revision, preview: preview.status(item.id),
     draftRevision: activeDraft(item)?.id ?? null, hasSavedDraft: Boolean(savedDraft(item))
   });
   function activeDraft(item) {
@@ -272,13 +277,18 @@ export async function createApp(config) {
     return reply.header('Set-Cookie', cookie(null, 0)).send({ ok: true });
   });
   route('GET', '/projects', async (request) =>
-    store.all('SELECT * FROM projects WHERE user_id = ? ORDER BY updated DESC', user(request).id).map(projectView));
+    store.all(selectProjects + ' WHERE user_id = ? ORDER BY updated DESC', user(request).id).map(projectView));
   route('POST', '/projects', async (request, reply) => {
     const owner = user(request).id;
     const name = field(request.body?.name, '项目名称', 60);
+    const kind = request.body?.kind ?? 'website';
+    if (!['website', 'research'].includes(kind)) throw new PublicError(400, '项目类型无效。');
     if (store.get('SELECT count(*) AS count FROM projects WHERE user_id = ?', owner).count >= 30) throw new PublicError(409, '项目数量已达上限。');
-    const item = { id: id(), name, user_id: owner, updated: Date.now(), active_revision: null };
-    store.run('INSERT INTO projects VALUES (?, ?, ?, ?, NULL)', item.id, owner, name, item.updated);
+    const item = { id: id(), name, kind, user_id: owner, updated: Date.now(), active_revision: null };
+    store.transaction(() => {
+      store.run('INSERT INTO projects VALUES (?, ?, ?, ?, NULL)', item.id, owner, name, item.updated);
+      if (kind === 'research') store.run('INSERT INTO research_projects VALUES (?)', item.id);
+    });
     return reply.code(201).send(projectView(item));
   });
   route('GET', '/projects/:id', async (request) => {
@@ -292,7 +302,7 @@ export async function createApp(config) {
         WHERE r.message_id = messages.id AND r.base_revision IS ? AND r.draft_files IS NOT NULL) AS has_checkpoint FROM messages
       LEFT JOIN message_reasoning ON message_reasoning.message_id = messages.id
       WHERE project_id = ? AND chat_id IS ? ORDER BY created, messages.rowid`, item.active_revision, item.id, chat);
-    return { project: projectView(item), chats, activeGeneration, messages: records.map(({ agent_events, ...record }) => ({
+    return { project: projectView(item), chats, activeGeneration, researchSearchAvailable: Boolean(config.searchWeb ?? config.deepseekKey), messages: records.map(({ agent_events, ...record }) => ({
       ...record, agent_events: agent_events ? JSON.parse(agent_events) : []
     })) };
   });
@@ -341,8 +351,39 @@ export async function createApp(config) {
     const rev = revision(ownedProject(request));
     return { revision: rev.id, version: rev.version, files: JSON.parse(rev.files) };
   });
+  function ownedReport(request) {
+    const item = ownedProject(request);
+    const report = store.get(`SELECT reports.html, reports.version FROM reports JOIN messages ON messages.id = reports.message_id
+      WHERE messages.id = ? AND messages.project_id = ?`, request.params.messageId, item.id);
+    if (!report) throw new PublicError(404, '找不到该报告。');
+    return { item, report };
+  }
+  const visibleReport = report => ({ ...report, html: showReportCharts(report.html) });
+  route('GET', '/projects/:id/reports/:messageId', async (request) => visibleReport(ownedReport(request).report));
+  app.route({
+    method: 'PATCH', url: prefix + '/api/projects/:id/reports/:messageId', bodyLimit: 500000,
+    async handler(request) {
+      const { item, report } = ownedReport(request);
+      if (request.body?.version !== report.version) throw new PublicError(409, '报告已有更新，请刷新后重新编辑。');
+      const html = cleanReport(request.body?.html);
+      if (html === report.html) return visibleReport(report);
+      store.transaction(() => {
+        store.run('UPDATE reports SET html = ?, version = version + 1 WHERE message_id = ?', html, request.params.messageId);
+        store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+      });
+      return visibleReport({ html, version: report.version + 1 });
+    }
+  });
+  route('GET', '/projects/:id/reports/:messageId/download', async (request, reply) => {
+    const { item, report } = ownedReport(request);
+    const fileName = encodeURIComponent(item.name).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16));
+    return reply.type('text/html; charset=utf-8')
+      .header('Content-Disposition', "attachment; filename=report.html; filename*=UTF-8''" + fileName + '.html')
+      .send(reportDocument(report.html));
+  });
   route('POST', '/projects/:id/generate', async (request, reply) => {
     const item = ownedProject(request);
+    const research = item.kind === 'research';
     const chat = projectChat(item.id, request.body?.chatId);
     const resumeId = request.body?.resumeMessageId == null ? null : field(request.body.resumeMessageId, '生成记录', 64);
     const resume = resumeId && store.get(`SELECT m.*, r.base_revision, r.draft_files FROM messages m JOIN generation_runs r ON r.message_id = m.id
@@ -352,8 +393,13 @@ export async function createApp(config) {
       throw new PublicError(409, '当前版本没有可继续的候选。');
     }
     const prompt = resume ? resume.prompt : field(request.body?.prompt, '需求', 6000);
+    const quickReply = research ? quickResearchReply(prompt) : undefined;
     const modelId = resume ? resume.model_id : field(request.body?.modelId ?? 'platform', '模型', 64);
+    if (research && modelId === 'demo') throw new PublicError(400, '请选择支持联网调研的模型。');
     const model = modelConfig(modelId, item.user_id);
+    const web = config.searchWeb === undefined && isDeepSeek(model) ? deepSeekWebTools(model.key) : undefined;
+    const search = config.searchWeb ?? web?.search;
+    const read = config.readResearchPage ?? web?.read;
     const messageId = resumeId ?? id();
     store.transaction(() => {
       if (store.get("SELECT id FROM messages WHERE project_id = ? AND state = 'running'", item.id)) throw new PublicError(409, '这个项目正在生成，请等待当前请求完成。');
@@ -363,16 +409,16 @@ export async function createApp(config) {
         store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
         return;
       }
-      if (modelId === 'platform') {
+      if (!quickReply && modelId === 'platform') {
         quota(item.user_id + ':platform', config.dailyUser ?? 5);
         quota('platform:all', config.dailyGlobal ?? 100);
-      } else {
+      } else if (!quickReply) {
         quota(item.user_id + ':' + (modelId === 'demo' ? 'demo' : 'custom'), config.dailyCustom ?? 30);
       }
       const now = Date.now();
       store.run('INSERT INTO messages (id, project_id, chat_id, prompt, model_id, model_name, state, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         messageId, item.id, chat, prompt, modelId, model.name, 'running', now);
-      if (modelId !== 'demo') store.run('INSERT INTO generation_runs (message_id, base_revision) VALUES (?, ?)', messageId, item.active_revision);
+      if (modelId !== 'demo' && !research) store.run('INSERT INTO generation_runs (message_id, base_revision) VALUES (?, ?)', messageId, item.active_revision);
       if (chat) store.run('UPDATE project_chats SET title = ? WHERE id = ? AND title IS NULL',
         [...prompt.replace(/\s+/gu, ' ')].slice(0, 32).join(''), chat);
       store.run('UPDATE projects SET updated = ? WHERE id = ?', now, item.id);
@@ -381,6 +427,17 @@ export async function createApp(config) {
     const { signal } = controller;
     const task = (async () => {
       const events = [];
+      function recordEvent(event) {
+        if (signal.aborted || events.length >= 100) return;
+        const index = events.push(event) - 1;
+        store.run('UPDATE messages SET agent_events = ? WHERE id = ?', JSON.stringify(events), messageId);
+        return (details) => {
+          if (signal.aborted || !details) return;
+          events[index] = { ...event, details: details.slice(0, 6000) };
+          store.run('UPDATE messages SET agent_events = ? WHERE id = ?', JSON.stringify(events), messageId);
+        };
+      }
+      const onActivity = (detail, decision) => recordEvent({ kind: 'activity', detail, decision: decision?.slice(0, 600) });
       const draftController = new AbortController();
       const draftSignal = AbortSignal.any([signal, draftController.signal]);
       let draft;
@@ -413,12 +470,43 @@ export async function createApp(config) {
         lastReasoningWrite = Date.now();
       };
       try {
+        if (research) {
+          const previous = !quickReply && store.all(`SELECT messages.prompt, reports.html FROM reports JOIN messages ON messages.id = reports.message_id
+            WHERE project_id = ? AND chat_id IS ? ORDER BY messages.created DESC, messages.rowid DESC LIMIT 6`, item.id, chat)
+            .find(report => !quickResearchReply(report.prompt));
+          const recent = quickReply ? [] : store.all(`SELECT substr(prompt, 1, 1500) AS request, substr(response, 1, 2000) AS answer,
+            result_type AS result FROM messages WHERE project_id = ? AND chat_id IS ? AND state = 'complete'
+            ORDER BY created DESC, rowid DESC LIMIT 6`, item.id, chat).reverse();
+          const onProgress = (stage) => {
+            if (!signal.aborted) store.run("UPDATE messages SET agent_progress = ? WHERE id = ? AND state = 'running'", stage, messageId);
+          };
+          onProgress('正在理解请求…');
+          const result = quickReply ? { type: 'answer', text: quickReply } : await runResearchTurn({
+            prompt, previous: previous?.html.slice(0, 24000), recent, search, read,
+            fetchCodePage: config.fetchResearchCodePage, signal, onProgress, onActivity,
+            maxTokens: isDeepSeek(model) ? (config.deepseekMaxTokens ?? 64000) : (config.maxTokens ?? 10000),
+            completion: (messages, maxTokens, options) => retryModelCompletion(completion, model, messages, maxTokens, options)
+          });
+          signal.throwIfAborted();
+          store.transaction(() => {
+            if (result.type === 'report') store.run('INSERT INTO reports (message_id, html) VALUES (?, ?)', messageId, result.html);
+            store.run("UPDATE messages SET state = 'complete', result_type = ?, response = ?, agent_progress = NULL WHERE id = ?",
+              result.type, result.text ?? null, messageId);
+            store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+          });
+          return;
+        }
+        const setBuildProgress = (stage) => {
+          if (signal.aborted) return;
+          store.run("UPDATE messages SET agent_progress = ? WHERE id = ? AND state = 'running'", stage || null, messageId);
+        };
         const prior = item.active_revision ? revision(item) : undefined;
         const baseline = prior ? JSON.parse(prior.files) : undefined;
         const previousAttempt = resume ? { state: resume.state, response: resume.response } : modelId === 'demo' ? undefined : store.get(`
           SELECT state, substr(response, 1, 1200) AS response FROM messages
           WHERE project_id = ? AND chat_id IS ? AND prompt = ? AND state IN ('failed', 'stopped')
           ORDER BY created DESC LIMIT 1`, item.id, chat, prompt);
+        if (modelId !== 'demo') setBuildProgress('正在整理项目上下文…');
         const memory = modelId === 'demo' ? undefined : await loadProjectMemory(store, item.id, model, completion, (error) => {
           app.log.warn({ project: item.id, name: error.name, code: error.code }, 'Could not update project memory');
         }, signal, chat);
@@ -428,9 +516,20 @@ export async function createApp(config) {
           ? '\n\n上次执行结果（供参考）：' + previousAttempt.response.slice(0, 1200)
           : '';
         const request = prompt + (draftFiles ? '\n\n当前文件是上次保存的未发布候选。继续完成原需求；若已完成修改，提交空 changes 以重新检查该候选。' : '') + context;
-        const provider = modelId === 'demo' ? demoCompletion : (...args) => retryModelCompletion(completion, ...args);
+        let modelTurns = 0;
+        const provider = modelId === 'demo' ? demoCompletion : (model, messages, maxTokens, options) => {
+          const stage = ++modelTurns === 1 ? '正在等待模型返回首个结果…' : '正在等待模型返回下一步结果…';
+          setBuildProgress(stage);
+          if (modelTurns === 1) recordEvent({ kind: 'progress', detail: stage });
+          return retryModelCompletion(completion, model, messages, maxTokens, options, (attempt, reason) => {
+            const detail = `正在第 ${attempt} 次重试模型请求…`;
+            setBuildProgress(detail);
+            onActivity(detail, reason);
+          });
+        };
         const output = await buildWebsite(model, request, draftFiles ?? baseline, provider, {
-            memory, signal, react: true, runCode: makeCodeRunner(config.codeLauncher),
+            memory, signal, timeoutMs: config.generationTimeoutMs, react: true, runCode: makeCodeRunner(config.codeLauncher),
+            search, readWebPage: read,
             testBrowser, requireBrowser: Boolean(testBrowser) && modelId !== 'demo',
             resumeDraft: Boolean(draftFiles), comparisonFiles: baseline ?? null,
             async controlPreview(action, useDraft, toolSignal) {
@@ -460,12 +559,11 @@ export async function createApp(config) {
               : (config.maxTokens ?? 10000),
             onProgress(stage) {
               if (signal.aborted) return;
-              store.run("UPDATE messages SET agent_progress = ? WHERE id = ? AND state = 'running'", stage || null, messageId);
+              setBuildProgress(stage);
+              if (stage) return recordEvent({ kind: 'progress', detail: stage });
             },
             onActivity({ detail, decision }) {
-              if (signal.aborted || events.length >= 100) return;
-              events.push({ kind: 'activity', detail, decision: decision?.slice(0, 600) });
-              store.run('UPDATE messages SET agent_events = ? WHERE id = ?', JSON.stringify(events), messageId);
+              return onActivity(detail, decision);
             },
             onReasoning(chunk) {
               if (signal.aborted || reasoningTruncated) return;
@@ -491,6 +589,7 @@ export async function createApp(config) {
         const active = project(item.id, item.user_id);
         if (active.active_revision !== item.active_revision) throw new PublicError(409, '项目版本已变化，请重新提交修改。');
         const next = id();
+        if (modelId !== 'demo') setBuildProgress('正在启用验收后的版本…');
         await preview.activate(active, next, output.files, () => store.transaction(() => {
           signal.throwIfAborted();
           if (project(item.id, item.user_id).active_revision !== item.active_revision) {
@@ -505,11 +604,25 @@ export async function createApp(config) {
         flushReasoning();
         if (signal.aborted) {
           store.run("UPDATE messages SET state = ?, agent_progress = NULL, response = ? WHERE id = ?",
-            closing ? 'failed' : 'stopped', closing ? '平台重启中断了生成。可继续修改已保存的候选。' : '已停止生成。', messageId);
+            closing ? 'failed' : 'stopped', closing
+              ? (research ? '平台重启中断了调研，请重试。' : '平台重启中断了生成。可继续修改已保存的候选。')
+              : '已停止生成。', messageId);
           return;
         }
-        if (!(error instanceof PublicError)) app.log.error({ project: item.id, code: error.code, name: error.name }, 'Generation failed');
-        store.run("UPDATE messages SET state = 'failed', response = ?, agent_progress = NULL WHERE id = ?", error instanceof PublicError ? error.message : '生成失败，请稍后重试。', messageId);
+        const timedOut = error instanceof GenerationTimeoutError;
+        const unexpected = !(error instanceof PublicError);
+        let response = unexpected ? '生成遇到平台内部错误，请稍后重试。' : error.message;
+        if (timedOut || unexpected) {
+          const stage = store.get('SELECT agent_progress FROM messages WHERE id = ?', messageId)?.agent_progress;
+          const candidate = !research && Boolean(store.get(
+            'SELECT draft_id FROM generation_runs WHERE message_id = ? AND draft_files IS NOT NULL', messageId)?.draft_id);
+          if (stage) response += '\n中断时，' + stage;
+          if (!research) response += candidate ? '\n已保存未发布的候选，可预览或继续修改。' : '\n本轮尚未保存候选文件。';
+          const context = { project: item.id, messageId, stage, candidate, code: error.code, name: error.name };
+          if (timedOut) app.log.warn(context, 'Generation timed out');
+          else app.log.error(context, 'Generation failed');
+        }
+        store.run("UPDATE messages SET state = 'failed', response = ?, agent_progress = NULL WHERE id = ?", response, messageId);
       } finally {
         await discardDraft();
       }

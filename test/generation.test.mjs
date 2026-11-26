@@ -11,6 +11,45 @@ const project = {
   'obsolete.js': '/* Remove this one */'
 };
 
+test('website generation uses only the job cancellation signal by default', async () => {
+  const { signal } = new AbortController();
+  const result = await buildWebsite({ platform: true }, '回答一个问题', undefined,
+    async (_model, _messages, _maxTokens, options) => {
+      assert.equal(options.signal, signal);
+      return '{"answer":"收到。"}';
+    }, { maxTokens: 1000, react: true, signal });
+  assert.equal(result.summary, '收到。');
+});
+
+test('website generation exposes web search and records the query and domain', async () => {
+  const url = 'https://example.org/filings';
+  const events = [];
+  const details = new Map();
+  const call = (name, args) => ({ message: { tool_calls: [{ id: name, type: 'function',
+    function: { name, arguments: JSON.stringify(args) } }] } });
+  const output = await buildWebsite({ platform: true, model: 'deepseek-reasoner' }, '做一页真实财报摘要', undefined,
+    async (_model, messages, _tokens, { tools }) => {
+      assert.ok(tools.some(({ function: fn }) => fn.name === 'search_web'));
+      const results = messages.filter(({ role }) => role === 'tool');
+      if (!results.length) return call('search_web', { query: '官方财报' });
+      if (results.length === 1) return call('read_web_page', { url: JSON.parse(results[0].content)[0].url });
+      assert.match(results[1].content, /官方财报正文/);
+      return JSON.stringify({ summary: '已生成', files: { 'index.html': `<a href="${url}">官方财报</a>`, 'server.js': project['server.js'] } });
+    }, {
+      maxTokens: 10000, react: true, onActivity(event) {
+        events.push(event);
+        return value => details.set(event.detail, value);
+      },
+      search: async () => [{ url, title: '官方财报' }], readWebPage: async () => ({ url, text: '官方财报正文' })
+    });
+  assert.match(output.files['index.html'], /官方财报/);
+  assert.deepEqual(events, [
+    { detail: '正在搜索公开网页', decision: '官方财报' }, { detail: '正在阅读 example.org', decision: undefined }
+  ]);
+  assert.match(details.get('正在搜索公开网页'), /官方财报\n官方财报（example\.org）/);
+  assert.match(details.get('正在阅读 example.org'), /example\.org\/filings\n已读取网页正文/);
+});
+
 test('temporary model errors retry the same request, while cancellation and permanent errors stop', async () => {
   const messages = [{ role: 'user', content: '原始输入' }];
   const retries = [];
@@ -342,6 +381,7 @@ test('ReAct plans, reads, stages, tests and repairs a candidate using browser fe
   const staged = [];
   const checked = [];
   const events = [];
+  const progressDetails = new Map();
   const first = '<h1>Incomplete</h1>';
   const final = '<h1>Ready</h1>';
   const config = { platform: true };
@@ -370,6 +410,7 @@ test('ReAct plans, reads, stages, tests and repairs a candidate using browser fe
     react: true, maxTokens: 32000, requireBrowser: true,
     onCandidate: files => staged.push(files['index.html']),
     onActivity: item => events.push(item),
+    onProgress: stage => detail => progressDetails.set(stage, detail),
     testBrowser(files) {
       const html = files['index.html'];
       checked.push(html);
@@ -380,6 +421,9 @@ test('ReAct plans, reads, stages, tests and repairs a candidate using browser fe
   assert.deepEqual(checked, [first, final]);
   assert.deepEqual(staged, [first, final, final]);
   assert.equal(result.files['index.html'], final);
+  assert.equal(progressDetails.get('正在读取相关文件…'), 'index.html · 已读取');
+  assert.match(progressDetails.get('正在检查网站预览…'), /检查文字「Ready」 · 通过/);
+  assert.match(progressDetails.get('正在检查候选网站…'), /采用已执行的候选测试结果/);
   assert.deepEqual(events.map(e => e.detail), ['计划', '已保存候选 candidate-1', '浏览器检查未通过',
     '已保存候选 candidate-2', '浏览器检查通过']);
 });

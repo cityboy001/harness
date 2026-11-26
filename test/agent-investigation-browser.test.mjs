@@ -125,3 +125,17 @@ test('real Chromium can open the requested page directly at a phone viewport', {
   assert.equal(result.steps[0].measurement.width, 375);
   assert.equal(result.steps[0].measurement.page, 'calendar.html');
 });
+
+test('scoped assertions match rendered lines and explain a genuine layout failure', {
+  skip: !executablePath && 'Set BUILDER_TEST_CHROMIUM to the Chromium executable', timeout: 12000
+}, async () => {
+  const website = { ...files, 'index.html': '<main><section id="entry" style="margin-left: 12px">' +
+    '<div>2026-11-13</div><div>中期分红</div><span hidden>隐藏文本</span></section></main>' };
+  const result = await browserTest({ files: website, actions: [
+    { action: 'assert_text', selector: '#entry', value: '2026-11-13 中期分红', exact: true },
+    { action: 'assert_layout', selector: '#entry', scope: 'main', metric: 'leftInset', comparison: 'max', limit: 0 }
+  ] }, { executablePath });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.steps[0].ok, true, JSON.stringify(result.steps[0]));
+  assert.match(result.steps[1].error, /index\.html.*#entry.*leftInset.*main.*实测 12 px.*至多为 0 px/);
+});
