@@ -20,8 +20,14 @@ const dayKey = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 1
 const sessionKey = (request) => cookieValue(request.headers.cookie);
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const assetTypes = { js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', svg: 'image/svg+xml' };
-const selectProjects = `SELECT projects.*, CASE WHEN research_projects.project_id IS NULL THEN 'website' ELSE 'research' END AS kind
-  FROM projects LEFT JOIN research_projects ON research_projects.project_id = projects.id`;
+const selectProjects = `SELECT projects.*, CASE
+  WHEN research_projects.project_id IS NOT NULL THEN 'research'
+  WHEN office_projects.project_id IS NOT NULL THEN office_projects.format
+  ELSE 'website'
+END AS kind
+  FROM projects
+  LEFT JOIN research_projects ON research_projects.project_id = projects.id
+  LEFT JOIN office_projects ON office_projects.project_id = projects.id`;
 
 function field(value, label, max, min = 1) {
   const result = typeof value === 'string' ? value.trim() : '';
@@ -282,12 +288,13 @@ export async function createApp(config) {
     const owner = user(request).id;
     const name = field(request.body?.name, '项目名称', 60);
     const kind = request.body?.kind ?? 'website';
-    if (!['website', 'research'].includes(kind)) throw new PublicError(400, '项目类型无效。');
+    if (!['website', 'research', 'ppt', 'excel', 'word'].includes(kind)) throw new PublicError(400, '项目类型无效。');
     if (store.get('SELECT count(*) AS count FROM projects WHERE user_id = ?', owner).count >= 30) throw new PublicError(409, '项目数量已达上限。');
     const item = { id: id(), name, kind, user_id: owner, updated: Date.now(), active_revision: null };
     store.transaction(() => {
       store.run('INSERT INTO projects VALUES (?, ?, ?, ?, NULL)', item.id, owner, name, item.updated);
       if (kind === 'research') store.run('INSERT INTO research_projects VALUES (?)', item.id);
+      if (['ppt', 'excel', 'word'].includes(kind)) store.run('INSERT INTO office_projects VALUES (?, ?)', item.id, kind);
     });
     return reply.code(201).send(projectView(item));
   });
@@ -515,7 +522,14 @@ export async function createApp(config) {
         const context = previousAttempt?.response
           ? '\n\n上次执行结果（供参考）：' + previousAttempt.response.slice(0, 1200)
           : '';
-        const request = prompt + (draftFiles ? '\n\n当前文件是上次保存的未发布候选。继续完成原需求；若已完成修改，提交空 changes 以重新检查该候选。' : '') + context;
+        const officeInstruction = item.kind === 'ppt'
+          ? '\n\n【PPT 项目】请使用现有 Agent 和预览能力创建一份幻灯片式页面：每张幻灯片独立清晰，包含标题、正文、图表或可视化，提供上一页/下一页交互，并保持专业版式。'
+          : item.kind === 'excel'
+          ? '\n\n【Excel 项目】请使用现有 Agent 和预览能力创建一个表格式工作区：包含清晰表头、结构化数据、筛选或汇总能力，并用专业版式展示公式结果和图表。'
+          : item.kind === 'word'
+          ? '\n\n【Word 项目】请使用现有 Agent 和预览能力创建一个文档式工作区：包含封面、目录、章节标题、段落、表格和页眉页脚式排版，并保持可读的长文档版式。'
+          : '';
+        const request = prompt + officeInstruction + (draftFiles ? '\n\n当前文件是上次保存的未发布候选。继续完成原需求；若已完成修改，提交空 changes 以重新检查该候选。' : '') + context;
         let modelTurns = 0;
         const provider = modelId === 'demo' ? demoCompletion : (model, messages, maxTokens, options) => {
           const stage = ++modelTurns === 1 ? '正在等待模型返回首个结果…' : '正在等待模型返回下一步结果…';

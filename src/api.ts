@@ -22,7 +22,7 @@ export function message(error: unknown) {
 }
 
 export interface User { id: string; name: string }
-export type ProjectKind = 'website' | 'research';
+export type ProjectKind = 'website' | 'research' | 'ppt' | 'excel' | 'word';
 export interface Project { id: string; name: string; kind: ProjectKind; updated: number; revision: string | null; draftRevision?: string | null; hasSavedDraft?: boolean; preview: 'starting' | 'running' | 'stopped' }
 export interface Model { id: string; name: string; model: string; source: 'platform' | 'custom' | 'demo'; available: boolean; baseUrl?: string }
 export type AgentRole = 'central' | 'frontend' | 'backend' | 'browser' | 'direct' | 'analyze' | 'read_project' | 'edit_project';

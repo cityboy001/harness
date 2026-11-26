@@ -72,6 +72,10 @@ export function openStore(root, encryptionKey) {
     CREATE TABLE IF NOT EXISTS research_projects (
       project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
     );
+    CREATE TABLE IF NOT EXISTS office_projects (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+      format TEXT NOT NULL CHECK(format IN ('ppt', 'excel', 'word'))
+    );
     CREATE TABLE IF NOT EXISTS reports (
       message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
       html TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
