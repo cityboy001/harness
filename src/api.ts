@@ -6,11 +6,12 @@ export class ApiError extends Error {
 
 export async function api<T>(path: string, method = 'GET', body?: unknown, anonymous = false): Promise<T> {
   const url = new URL('./api/' + path, location.href);
+  const file = body instanceof Blob;
   const response = await fetch(url, {
     method,
     credentials: anonymous ? 'omit' : 'same-origin',
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body)
+    headers: body === undefined ? undefined : { 'Content-Type': file ? 'application/octet-stream' : 'application/json' },
+    body: body === undefined ? undefined : file ? body : JSON.stringify(body)
   }).catch(() => { throw new ApiError(0, '暂时无法连接服务器，请检查网络后重试。'); });
   const value = await response.json().catch(() => null);
   if (!response.ok) throw new ApiError(response.status, value?.error || '网络请求失败，请稍后重试。');
@@ -22,7 +23,7 @@ export function message(error: unknown) {
 }
 
 export interface User { id: string; name: string }
-export type ProjectKind = 'website' | 'research' | 'ppt' | 'word';
+export type ProjectKind = 'website' | 'research' | 'ppt' | 'word' | 'knowledge';
 export interface Project { id: string; name: string; kind: ProjectKind; updated: number; revision: string | null; draftRevision?: string | null; hasSavedDraft?: boolean; preview: 'starting' | 'running' | 'stopped' }
 export interface Model { id: string; name: string; model: string; source: 'platform' | 'custom' | 'demo'; available: boolean; baseUrl?: string }
 export type AgentRole = 'central' | 'frontend' | 'backend' | 'browser' | 'direct' | 'analyze' | 'read_project' | 'edit_project';
@@ -49,7 +50,7 @@ export type AgentEvent =
   | { kind: 'activity'; taskId?: string; detail: string; decision?: string; details?: string }
   | { kind: 'progress'; detail: string; details?: string; taskId?: never; decision?: never }
   | { kind: 'acceptance'; taskId?: string; candidateDigest: string; round: number; items: AcceptanceItem[] };
-export interface Conversation { id: string; prompt: string; model_id: string; model_name: string; state: 'running' | 'failed' | 'complete' | 'stopped'; response: string | null; created: number; has_reasoning: 0 | 1; has_checkpoint?: 0 | 1; result_type: 'answer' | 'revision' | 'report' | 'ppt' | 'word' | null; agent_progress: string | null; agent_events?: AgentEvent[] }
+export interface Conversation { id: string; prompt: string; model_id: string; model_name: string; state: 'running' | 'failed' | 'complete' | 'stopped'; response: string | null; created: number; has_reasoning: 0 | 1; has_checkpoint?: 0 | 1; result_type: 'answer' | 'revision' | 'report' | 'ppt' | 'word' | null; agent_progress: string | null; agent_events?: AgentEvent[]; attachments?: ChatAttachment[] }
 export interface ProjectChat { id: string; title: string }
 export interface ProjectWorkspace {
   project: Project;
@@ -132,6 +133,15 @@ export interface WordDoc {
   sections: WordSection[];
 }
 export interface WordDocRecord { doc: WordDoc; version: number }
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  size: number;
+  created: number;
+  state: 'uploading' | 'parsing' | 'ready' | 'failed';
+  error: string | null;
+  thumbnail?: string | null;
+}
 export interface Revision { revision: string; version: number; files: Record<string, string> }
 export interface SharedRevision extends Revision { name: string }
 export interface ShareLink { url: string; expires: number; version: number; current: boolean }

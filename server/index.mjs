@@ -20,6 +20,7 @@ const app = await createApp({
   assets: fileURLToPath(new URL('../dist/', import.meta.url)),
   logger: true,
   deepseekKey: env.DEEPSEEK_API_KEY?.trim(),
+  mineruKey: env.MINERU_API_KEY?.trim(),
   deepseekModel: env.DEEPSEEK_MODEL?.trim(),
   encryptionKey: env.CREDENTIAL_KEY,
   launcher: env.PREVIEW_LAUNCHER,

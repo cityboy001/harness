@@ -90,6 +90,24 @@ export function openStore(root, encryptionKey) {
       message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
       doc TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS knowledge_projects (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS knowledge_files (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES knowledge_projects(project_id) ON DELETE CASCADE,
+      name TEXT NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL,
+      state TEXT NOT NULL, batch TEXT, text TEXT, error TEXT, checked INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS knowledge_file_project ON knowledge_files(project_id, created);
+    CREATE TABLE IF NOT EXISTS chat_attachments (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      chat_id TEXT REFERENCES project_chats(id) ON DELETE CASCADE,
+      message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL,
+      state TEXT NOT NULL, batch TEXT, text TEXT, error TEXT, thumbnail TEXT, checked INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS chat_attachment_scope ON chat_attachments(project_id, chat_id, created);
     CREATE TABLE IF NOT EXISTS project_memory (
       project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
       through_rowid INTEGER NOT NULL, summary TEXT NOT NULL, updated INTEGER NOT NULL
@@ -120,6 +138,16 @@ export function openStore(root, encryptionKey) {
   if (!messageColumns.has('agent_events')) db.exec('ALTER TABLE messages ADD COLUMN agent_events TEXT');
   if (!messageColumns.has('chat_id')) db.exec('ALTER TABLE messages ADD COLUMN chat_id TEXT REFERENCES project_chats(id) ON DELETE CASCADE');
   db.exec('CREATE INDEX IF NOT EXISTS chat_message_history ON messages(project_id, chat_id, created)');
+  const attachmentColumns = new Set(db.prepare('PRAGMA table_info(chat_attachments)').all().map(({ name }) => name));
+  if (!attachmentColumns.has('message_id')) {
+    db.exec('ALTER TABLE chat_attachments ADD COLUMN message_id TEXT REFERENCES messages(id) ON DELETE CASCADE');
+  }
+  if (!attachmentColumns.has('thumbnail')) {
+    db.exec('ALTER TABLE chat_attachments ADD COLUMN thumbnail TEXT');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS chat_attachment_message ON chat_attachments(message_id)');
+  db.exec("UPDATE knowledge_files SET state = 'failed', error = '上传被中断，请重新上传。' WHERE state = 'uploading'");
+  db.exec("UPDATE chat_attachments SET state = 'failed', error = '上传被中断，请重新上传。' WHERE state = 'uploading'");
   db.prepare(`UPDATE messages SET state = 'failed', agent_progress = NULL, response = CASE WHEN EXISTS (
     SELECT 1 FROM generation_runs WHERE message_id = messages.id AND draft_files IS NOT NULL
   ) THEN ? ELSE ? END WHERE state = 'running'`).run('平台重启中断了生成，可继续修改候选。', '平台重启中断了生成，请重试。');

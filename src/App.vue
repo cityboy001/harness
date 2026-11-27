@@ -1,16 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
-  ArrowLeft, Blocks, BookText, Check, ChevronDown, CircleAlert, Code2, Ellipsis, FileCode2, FileText, FolderOpen,
-  Copy, Globe2, Link2, LoaderCircle, LockKeyhole, LogOut, Monitor, Pencil, Play, Plus, Presentation, RotateCw, Send, Settings2,
+  ArrowLeft, Blocks, BookOpen, BookText, Check, ChevronDown, CircleAlert, Code2, Ellipsis, FileCode2, FileText, LayoutGrid,
+  Copy, Globe2, Link2, LoaderCircle, LockKeyhole, LogOut, Monitor, Paperclip, Pencil, Play, Plus, Presentation, RotateCw, Send, Settings2,
   Sparkles, Square, Trash2, X
 } from 'lucide-vue-next';
-import { ApiError, api, message, type Conversation, type Model, type Project, type ProjectChat, type ProjectKind, type ProjectWorkspace, type Revision, type SharedRevision, type ShareLink, type User } from './api';
+import { ApiError, api, message, type ChatAttachment, type Conversation, type Model, type Project, type ProjectChat, type ProjectKind, type ProjectWorkspace, type Revision, type SharedRevision, type ShareLink, type User } from './api';
 import PreviewFrame from './PreviewFrame.vue';
 import AgentProgress from './AgentProgress.vue';
 import ReportPane from './ReportPane.vue';
 import PptPane from './PptPane.vue';
 import WordPane from './WordPane.vue';
+import KnowledgePane from './KnowledgePane.vue';
 
 const conversationPane = ref<HTMLElement | null>(null);
 const conversationWidth = ref<number>();
@@ -89,6 +90,7 @@ const authMode = ref<'login' | 'register'>('register');
 const username = ref('');
 const password = ref('');
 const projects = ref<Project[]>([]);
+const projectCategory = ref<ProjectKind | 'all'>('all');
 const current = ref<Project | null>(null);
 const reportId = ref('');
 const researchSearchAvailable = ref(false);
@@ -117,7 +119,7 @@ const starting = ref(false);
 const sending = ref(false);
 const stopping = ref(false);
 const name = ref('');
-const modal = ref<'create' | 'rename' | 'delete' | 'models' | 'share' | null>(null);
+const modal = ref<'create' | 'rename' | 'delete' | 'models' | 'share' | 'attachment' | null>(null);
 const newProjectKind = ref<ProjectKind>('website');
 const modalError = ref('');
 const modelFeedback = ref('');
@@ -126,6 +128,38 @@ const modelDraft = ref({ id: '', name: '', baseUrl: '', model: '', key: '' });
 const thread = ref<HTMLElement | null>(null);
 const nameInput = ref<HTMLInputElement | null>(null);
 const shareInput = ref<HTMLInputElement | null>(null);
+const attachmentPicker = ref<HTMLInputElement | null>(null);
+const attachments = ref<ChatAttachment[]>([]);
+const attachmentMineru = ref(false);
+const attachmentUploading = ref(false);
+const attachmentError = ref('');
+const attachmentDragging = ref(false);
+const removingAttachment = ref('');
+const previewAttachment = ref<{ id: string; name: string; text: string; thumbnail?: string | null } | null>(null);
+let attachmentToken = 0;
+let attachmentVersion = 0;
+let attachmentRefreshing = false;
+let dragDepth = 0;
+const attachmentSizeLimit = 10 * 1024 * 1024;
+const localAttachmentAccept = '.txt,.md,.csv,.tsv,.json,.xml,.yaml,.yml,.log';
+const mineruAttachmentAccept = '.xls,.xlsx,.doc,.docx,.ppt,.pptx,.pdf,.png,.jpg,.jpeg,.jp2,.webp,.gif,.bmp';
+const attachmentStatusLabel: Record<ChatAttachment['state'], string> = {
+  uploading: '上传中',
+  parsing: '解析中',
+  ready: '已就绪',
+  failed: '解析失败'
+};
+const pasteMimeExt: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/bmp': '.bmp',
+  'text/plain': '.txt',
+  'text/markdown': '.md',
+  'text/csv': '.csv',
+  'application/pdf': '.pdf'
+};
 const shareToken = new URL(location.href).searchParams.get('share');
 const sharedPath = 'shares/' + encodeURIComponent(shareToken ?? '');
 const sharedPage = ref<SharedRevision | null>(null);
@@ -143,13 +177,28 @@ const customModels = computed(() => models.value.filter((model) => model.source 
 const research = computed(() => current.value?.kind === 'research');
 const ppt = computed(() => current.value?.kind === 'ppt');
 const word = computed(() => current.value?.kind === 'word');
-const websiteProjects = computed(() => projects.value.filter((item) => item.kind === 'website'));
-const researchProjects = computed(() => projects.value.filter((item) => item.kind === 'research'));
-const pptProjects = computed(() => projects.value.filter((item) => item.kind === 'ppt'));
-const wordProjects = computed(() => projects.value.filter((item) => item.kind === 'word'));
-const workspaceModels = computed(() => (research.value || ppt.value || word.value) ? models.value.filter((model) => model.source !== 'demo') : models.value);
+const knowledge = computed(() => current.value?.kind === 'knowledge');
+const supportsAttachments = computed(() => Boolean(current.value && current.value.kind !== 'knowledge'));
+const attachmentAccept = computed(() => attachmentMineru.value ? localAttachmentAccept + ',' + mineruAttachmentAccept : localAttachmentAccept);
+const pendingAttachmentCount = computed(() => attachments.value.filter((item) => item.state === 'uploading' || item.state === 'parsing').length);
+const hasPendingAttachments = computed(() => attachmentUploading.value || pendingAttachmentCount.value > 0);
+const projectCategories = [
+  { kind: 'website', title: '网站项目', icon: Globe2, createLabel: '新建项目', emptyLabel: '还没有网站项目' },
+  { kind: 'research', title: '调研报告', icon: FileText, createLabel: '新建调研', emptyLabel: '还没有调研报告' },
+  { kind: 'ppt', title: 'PPT 演示文稿', icon: Presentation, createLabel: '新建 PPT', emptyLabel: '还没有演示文稿' },
+  { kind: 'word', title: 'Word 文档', icon: BookText, createLabel: '新建 Word 文档', emptyLabel: '还没有 Word 文档' },
+  { kind: 'knowledge', title: '知识库问答', icon: BookOpen, createLabel: '新建知识库', emptyLabel: '还没有知识库' }
+] as const;
+const projectGroups = computed(() => projectCategories.map((category) => ({
+  ...category, items: projects.value.filter((item) => item.kind === category.kind)
+})));
+const visibleProjectGroups = computed(() => projectGroups.value.filter((group) =>
+  projectCategory.value === 'all' || projectCategory.value === group.kind));
+const workspaceModels = computed(() => current.value && current.value.kind !== 'website' ? models.value.filter((model) => model.source !== 'demo') : models.value);
 const activeModel = computed(() => workspaceModels.value.find((model) => model.id === selectedModel.value) ?? platform.value);
 const fileNames = computed(() => Object.keys(source.value?.files ?? {}).sort());
+const sourceText = computed(() => source.value?.files[sourceFile.value] ?? '');
+const sourceLineNumbers = computed(() => sourceText.value.split(/\r\n|\n|\r/).map((_, index) => index + 1).join('\n'));
 const demoModel = computed(() => models.value.find((model) => model.source === 'demo'));
 
 function formatDate(value: number) {
@@ -193,6 +242,10 @@ function openReport(id: string) {
 function resetWorkspace() {
   viewToken++;
   renderToken++;
+  attachmentToken++;
+  attachmentVersion = 0;
+  attachmentRefreshing = false;
+  dragDepth = 0;
   current.value = null;
   reportId.value = '';
   selectedChat.value = '';
@@ -202,6 +255,13 @@ function resetWorkspace() {
   loadingChat.value = false;
   chatDrafts.clear();
   history.value = [];
+  attachments.value = [];
+  attachmentMineru.value = false;
+  attachmentUploading.value = false;
+  attachmentError.value = '';
+  attachmentDragging.value = false;
+  removingAttachment.value = '';
+  previewAttachment.value = null;
   source.value = null;
   sourceFile.value = '';
   preview.value = null;
@@ -213,6 +273,209 @@ function resetWorkspace() {
   sending.value = false;
   stopping.value = false;
   tab.value = 'preview';
+}
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+function attachmentApiPath(projectId: string, chatId: string, name?: string) {
+  const params = new URLSearchParams();
+  if (chatId) params.set('chat', chatId);
+  if (name) params.set('name', name);
+  const query = params.toString();
+  return 'projects/' + projectId + '/attachments' + (query ? '?' + query : '');
+}
+async function loadAttachments(force = false) {
+  const project = current.value;
+  if (!project || project.kind === 'knowledge') return;
+  if (attachmentRefreshing && !force) return;
+  attachmentRefreshing = true;
+  const token = attachmentToken;
+  const projectId = project.id;
+  const chatId = selectedChat.value;
+  const version = attachmentVersion;
+  try {
+    const result = await api<{ files: ChatAttachment[]; mineru: boolean }>(attachmentApiPath(projectId, chatId));
+    if (token !== attachmentToken || current.value?.id !== projectId || selectedChat.value !== chatId) return;
+    attachmentMineru.value = result.mineru;
+    if (version === attachmentVersion) attachments.value = result.files;
+  } catch (error) {
+    if (token === attachmentToken && current.value?.id === projectId && selectedChat.value === chatId) {
+      attachmentError.value = message(error);
+    }
+  } finally {
+    if (token === attachmentToken) attachmentRefreshing = false;
+  }
+}
+function normalizeAttachmentName(file: File, index: number) {
+  const raw = (file.name || '').trim();
+  const mimeExt = pasteMimeExt[file.type.toLowerCase()] || '';
+  const isGenericImage = file.type.startsWith('image/') && (!raw || /^(?:image|blob|screenshot)\.[a-z0-9]+$/i.test(raw) || !raw.includes('.'));
+  if (isGenericImage) {
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const stamp = pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+    const ext = mimeExt || (raw.includes('.') ? raw.slice(raw.lastIndexOf('.')).toLowerCase() : '.png');
+    return `粘贴图片-${stamp}${index > 0 ? '-' + (index + 1) : ''}${ext}`;
+  }
+  if (raw && !raw.includes('.') && mimeExt) return raw + mimeExt;
+  return raw || `附件-${Date.now()}${mimeExt}`;
+}
+function isImageAttachment(file: File, fileName: string) {
+  return file.type.startsWith('image/') || /\.(?:png|jpe?g|webp|gif|bmp)$/i.test(fileName);
+}
+async function createImageThumbnail(file: File): Promise<string | null> {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('decode failed'));
+      el.src = url;
+    });
+    const width = img.naturalWidth || img.width;
+    const height = img.naturalHeight || img.height;
+    if (!width || !height) return null;
+    for (const [maxEdge, quality] of [[360, 0.82], [240, 0.72], [180, 0.65]] as const) {
+      const scale = Math.min(1, maxEdge / Math.max(width, height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(width * scale));
+      canvas.height = Math.max(1, Math.round(height * scale));
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const webp = canvas.toDataURL('image/webp', quality);
+      const dataUrl = webp.startsWith('data:image/webp;') ? webp : canvas.toDataURL('image/jpeg', quality);
+      if (dataUrl.length <= 56000) return dataUrl;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+async function uploadAttachmentFiles(fileList: File[]) {
+  const project = current.value;
+  if (!project || project.kind === 'knowledge' || !fileList.length) return;
+  const token = attachmentToken;
+  const projectId = project.id;
+  const chatId = selectedChat.value;
+  const errors: string[] = [];
+  attachmentError.value = '';
+  attachmentUploading.value = true;
+  try {
+    for (let i = 0; i < fileList.length; i++) {
+      if (token !== attachmentToken || current.value?.id !== projectId || selectedChat.value !== chatId) break;
+      const file = fileList[i];
+      const fileName = normalizeAttachmentName(file, i);
+      if (!file.size) {
+        errors.push(fileName + ' 为空文件。');
+        continue;
+      }
+      if (file.size > attachmentSizeLimit) {
+        errors.push(fileName + ' 超过 10 MB 限制。');
+        continue;
+      }
+      try {
+        const thumbnail = isImageAttachment(file, fileName) ? await createImageThumbnail(file) : null;
+        const saved = await api<ChatAttachment>(attachmentApiPath(projectId, chatId, fileName), 'POST', file);
+        if (token !== attachmentToken || current.value?.id !== projectId || selectedChat.value !== chatId) break;
+        if (thumbnail) {
+          saved.thumbnail = thumbnail;
+          void api('projects/' + projectId + '/attachments/' + saved.id + '/thumbnail', 'PATCH', { thumbnail }).catch(() => {});
+        }
+        attachmentVersion++;
+        attachments.value = [...attachments.value.filter((item) => item.id !== saved.id), saved];
+      } catch (error) {
+        errors.push(fileName + '：' + message(error));
+      }
+    }
+    if (token === attachmentToken && current.value?.id === projectId && selectedChat.value === chatId) {
+      attachmentError.value = errors.join('\n');
+    }
+  } finally {
+    if (token === attachmentToken) attachmentUploading.value = false;
+  }
+}
+function onAttachmentInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const picked = [...(input.files ?? [])];
+  input.value = '';
+  if (picked.length) void uploadAttachmentFiles(picked);
+}
+function onComposerPaste(event: ClipboardEvent) {
+  if (!supportsAttachments.value || !event.clipboardData) return;
+  const pasted: File[] = [];
+  if (event.clipboardData.files.length) {
+    pasted.push(...event.clipboardData.files);
+  } else {
+    for (const item of event.clipboardData.items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) pasted.push(file);
+      }
+    }
+  }
+  if (!pasted.length) return;
+  event.preventDefault();
+  void uploadAttachmentFiles(pasted);
+}
+function onComposerDragEnter(event: DragEvent) {
+  if (!supportsAttachments.value || !event.dataTransfer?.types.includes('Files')) return;
+  event.preventDefault();
+  dragDepth++;
+  attachmentDragging.value = true;
+}
+function onComposerDragOver(event: DragEvent) {
+  if (!supportsAttachments.value || !event.dataTransfer?.types.includes('Files')) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+}
+function onComposerDragLeave(event: DragEvent) {
+  if (!supportsAttachments.value) return;
+  event.preventDefault();
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) attachmentDragging.value = false;
+}
+function onComposerDrop(event: DragEvent) {
+  if (!supportsAttachments.value) return;
+  event.preventDefault();
+  dragDepth = 0;
+  attachmentDragging.value = false;
+  const dropped = [...(event.dataTransfer?.files ?? [])];
+  if (dropped.length) void uploadAttachmentFiles(dropped);
+}
+async function openAttachmentPreview(file: ChatAttachment) {
+  const project = current.value;
+  if (!project || file.state !== 'ready') return;
+  attachmentError.value = '';
+  try {
+    previewAttachment.value = await api<{ id: string; name: string; text: string; thumbnail?: string | null }>('projects/' + project.id + '/attachments/' + file.id);
+    modal.value = 'attachment';
+  } catch (error) {
+    attachmentError.value = message(error);
+  }
+}
+async function removeAttachment(file: ChatAttachment) {
+  const project = current.value;
+  if (!project || removingAttachment.value) return;
+  removingAttachment.value = file.id;
+  attachmentError.value = '';
+  try {
+    await api('projects/' + project.id + '/attachments/' + file.id, 'DELETE');
+    attachmentVersion++;
+    attachments.value = attachments.value.filter((item) => item.id !== file.id);
+    if (previewAttachment.value?.id === file.id) {
+      previewAttachment.value = null;
+      if (modal.value === 'attachment') modal.value = null;
+    }
+  } catch (error) {
+    attachmentError.value = message(error);
+  } finally {
+    removingAttachment.value = '';
+  }
 }
 async function initialize() {
   try {
@@ -311,6 +574,7 @@ async function signOut() {
     authMode.value = 'login';
     resetWorkspace();
     projects.value = [];
+    projectCategory.value = 'all';
     models.value = [];
     setUrl(undefined, true);
   } catch (error) {
@@ -364,9 +628,10 @@ async function openProject(id: string, updateUrl = true, chat = '', report = '')
     if (viewToken !== token || !user.value) return;
     selectedChat.value = chat;
     updateWorkspace(result);
-    if ((research.value || ppt.value || word.value) && selectedModel.value === 'demo') selectedModel.value = 'platform';
+    if (result.project.kind !== 'website' && selectedModel.value === 'demo') selectedModel.value = 'platform';
     showLinkedReport(report);
     setUrl(id, !updateUrl, chat, reportId.value);
+    if (result.project.kind !== 'knowledge') void loadAttachments(true);
     if (result.project.preview === 'running' || result.project.draftRevision) await loadPreview();
     scrollThread();
   } catch (error) {
@@ -384,8 +649,14 @@ async function selectChat(chat: string, updateUrl = true) {
   prompt.value = chatDrafts.get(chat) ?? '';
   history.value = [];
   workspaceError.value = '';
+  attachmentToken++;
+  attachmentVersion = 0;
+  attachmentRefreshing = false;
+  attachments.value = [];
+  attachmentError.value = '';
   loadingChat.value = true;
   if (updateUrl) setUrl(id, false, chat);
+  void loadAttachments(true);
   await refreshWorkspace(true);
 }
 async function createChat() {
@@ -512,11 +783,11 @@ async function runPreview(start: boolean, draft = false) {
 function sendOnEnter(event: KeyboardEvent) {
   if (event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
-  if (!event.repeat && activeModel.value?.available) void generate();
+  if (!event.repeat && activeModel.value?.available && !hasPendingAttachments.value) void generate();
 }
 
 async function generate(value = prompt.value, retryModel?: string, resumeMessageId?: string) {
-  if (!current.value || running.value || sending.value || loadingChat.value || !value.trim()) return;
+  if (!current.value || running.value || sending.value || loadingChat.value || hasPendingAttachments.value || !value.trim()) return;
   const token = viewToken;
   const chatId = selectedChat.value;
   sending.value = true;
@@ -527,7 +798,13 @@ async function generate(value = prompt.value, retryModel?: string, resumeMessage
     if (token !== viewToken) return;
     if (!retryModel) {
       chatDrafts.delete(chatId);
-      if (chatId === selectedChat.value) prompt.value = '';
+      if (chatId === selectedChat.value) {
+        prompt.value = '';
+        if (supportsAttachments.value) {
+          attachmentVersion++;
+          attachments.value = attachments.value.filter((item) => item.state !== 'ready');
+        }
+      }
     }
     await refreshWorkspace(true);
   } catch (error) {
@@ -569,6 +846,7 @@ function closeModal() {
   if (busy.value) return;
   modal.value = null;
   modelDraft.value.key = '';
+  previewAttachment.value = null;
 }
 async function saveProject() {
   busy.value = true;
@@ -639,7 +917,10 @@ onMounted(() => {
     return;
   }
   void initialize();
-  poll = setInterval(() => void refreshWorkspace(), 1800);
+  poll = setInterval(() => {
+    void refreshWorkspace();
+    if (supportsAttachments.value && pendingAttachmentCount.value > 0) void loadAttachments();
+  }, 1500);
   window.addEventListener('popstate', routeChanged);
 });
 onUnmounted(() => {
@@ -663,7 +944,7 @@ onUnmounted(() => {
       <h1>无法打开分享预览</h1><p role="alert">{{ sharedError }}</p>
     </div>
   </main>
-  <div v-else class="app-shell" :class="{ 'has-workspace': current, 'has-report-workspace': research || ppt || word }">
+  <div v-else class="app-shell" :class="{ 'has-workspace': current }">
     <header class="topbar">
       <div v-if="current" class="breadcrumbs">
         <button class="quiet back" type="button" @click="back"><ArrowLeft :size="17" /> 我的项目</button>
@@ -710,58 +991,55 @@ onUnmounted(() => {
     </main>
 
     <main v-else-if="!current" class="projects">
-      <div class="page-heading">
-        <div><h1>我的项目</h1><p>打开已有网站，或从一句需求开始。</p></div>
-        <button class="primary" @click="projectModal('create')"><Plus :size="17" /> 新建项目</button>
+      <aside class="project-sidebar">
+        <h2 id="project-categories">项目分类</h2>
+        <nav aria-labelledby="project-categories">
+          <button type="button" :aria-pressed="projectCategory === 'all'" @click="projectCategory = 'all'">
+            <LayoutGrid :size="17" /> 全部项目 <span>{{ projects.length }}</span>
+          </button>
+          <button v-for="group in projectGroups" :key="group.kind" type="button"
+            :aria-pressed="projectCategory === group.kind" @click="projectCategory = group.kind">
+            <component :is="group.icon" :size="17" /> {{ group.title }} <span>{{ group.items.length }}</span>
+          </button>
+        </nav>
+      </aside>
+      <div class="project-content">
+        <header class="project-heading"><h1>我的项目</h1></header>
+        <p v-if="pageError" class="error notice" role="alert">{{ pageError }}</p>
+        <div class="project-grid" :class="{ 'single-category': projectCategory !== 'all' }">
+          <section v-for="group in visibleProjectGroups" :key="group.kind" class="project-category"
+            :data-kind="group.kind" :aria-labelledby="'category-' + group.kind">
+            <header class="project-category-header">
+              <span class="project-icon"><component :is="group.icon" :size="20" /></span>
+              <h2 :id="'category-' + group.kind">{{ group.title }}</h2>
+              <button :class="{ primary: group.kind === 'website' }" type="button" @click="projectModal('create', undefined, group.kind)">
+                <Plus :size="16" /> {{ group.createLabel }}
+              </button>
+            </header>
+            <div v-if="group.items.length" class="project-list">
+              <article v-for="item in group.items" :key="item.id" class="project-row">
+                <button class="project-entry" @click="openProject(item.id)"><strong>{{ item.name }}</strong><span>{{ formatDate(item.updated) }} 更新</span></button>
+                <span v-if="item.kind === 'website'" class="status" :class="item.preview"><i></i>{{ stateLabel(item) }}</span>
+                <details class="menu row-menu">
+                  <summary class="icon" :aria-label="item.name + ' 项目操作'"><Ellipsis :size="19" /></summary>
+                  <div class="menu-items">
+                    <button @click="projectModal('rename', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Pencil :size="15" /> 重命名</button>
+                    <button class="danger-text" @click="projectModal('delete', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Trash2 :size="15" /> 删除项目</button>
+                  </div>
+                </details>
+              </article>
+            </div>
+            <p v-else class="empty-projects">{{ group.emptyLabel }}</p>
+          </section>
+        </div>
       </div>
-      <p v-if="pageError" class="error notice" role="alert">{{ pageError }}</p>
-      <section v-for="group in [{ kind: 'website', items: websiteProjects }, { kind: 'research', items: researchProjects }, { kind: 'ppt', items: pptProjects }, { kind: 'word', items: wordProjects }]"
-        :key="group.kind" :class="{ 'research-projects': group.kind !== 'website' }"
-        :aria-label="group.kind === 'research' ? '调研报告' : group.kind === 'ppt' ? 'PPT 演示文稿' : group.kind === 'word' ? 'Word 文档' : '网站项目'">
-        <header v-if="group.kind === 'research'" class="research-entry">
-          <span class="project-icon"><FileText :size="20" /></span>
-          <div><h2>调研报告</h2><p>联网查资料，在线编辑和导出报告。</p></div>
-          <button type="button" @click="projectModal('create', undefined, 'research')"><Plus :size="17" /> 新建调研</button>
-        </header>
-        <header v-else-if="group.kind === 'ppt'" class="research-entry">
-          <span class="project-icon"><Presentation :size="20" /></span>
-          <div><h2>PPT 演示文稿</h2><p>浏览器实时排版检查，在线预览、编辑并导出 PPTX / PDF。</p></div>
-          <button type="button" @click="projectModal('create', undefined, 'ppt')"><Plus :size="17" /> 新建 PPT</button>
-        </header>
-        <header v-else-if="group.kind === 'word'" class="research-entry">
-          <span class="project-icon"><BookText :size="20" /></span>
-          <div><h2>Word 文档</h2><p>浏览器 A4 排版自检，在线编辑并导出原生 Word (.docx) / PDF。</p></div>
-          <button type="button" @click="projectModal('create', undefined, 'word')"><Plus :size="17" /> 新建 Word</button>
-        </header>
-        <div v-if="group.items.length" class="project-list">
-          <article v-for="item in group.items" :key="item.id" class="project-row">
-            <span class="project-icon">
-              <FileText v-if="item.kind === 'research'" :size="20" /><Presentation v-else-if="item.kind === 'ppt'" :size="20" /><BookText v-else-if="item.kind === 'word'" :size="20" /><Globe2 v-else :size="20" />
-            </span>
-            <button class="project-entry" @click="openProject(item.id)"><strong>{{ item.name }}</strong><span>{{ formatDate(item.updated) }} 更新</span></button>
-            <span v-if="item.kind === 'website'" class="status" :class="item.preview"><i></i>{{ stateLabel(item) }}</span>
-            <details class="menu row-menu">
-              <summary class="icon" :aria-label="item.name + ' 项目操作'"><Ellipsis :size="19" /></summary>
-              <div class="menu-items">
-                <button @click="projectModal('rename', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Pencil :size="15" /> 重命名</button>
-                <button class="danger-text" @click="projectModal('delete', item); ($event.currentTarget as HTMLElement).closest('details')?.removeAttribute('open')"><Trash2 :size="15" /> 删除项目</button>
-              </div>
-            </details>
-          </article>
-        </div>
-        <div v-else-if="group.kind === 'website'" class="empty-projects">
-          <span class="large-icon"><FolderOpen :size="25" /></span>
-          <h2>还没有项目</h2><p>创建项目后，就可以描述你想做的网站。</p>
-          <button @click="projectModal('create')"><Plus :size="17" /> 新建项目</button>
-        </div>
-      </section>
     </main>
 
-    <main v-else class="workspace" :class="{ 'resizing-workspace': draggingDivider }"
+    <main v-else class="workspace" :class="{ 'resizing-workspace': draggingDivider, 'knowledge-workspace': knowledge }"
       :style="{ '--conversation-width': conversationWidth === undefined ? undefined : conversationWidth + 'px' }">
       <aside id="conversation-pane" ref="conversationPane" class="conversation">
         <header class="pane-head chat-head">
-          <strong>{{ research ? '调研对话' : ppt ? 'PPT 对话' : word ? 'Word 对话' : '建站对话' }}</strong>
+          <strong>{{ knowledge ? '知识库问答' : research ? '调研对话' : ppt ? 'PPT 对话' : word ? 'Word 对话' : '建站对话' }}</strong>
           <select :value="selectedChat" aria-label="切换对话" @change="selectChat(($event.target as HTMLSelectElement).value)">
             <option value="">默认对话</option>
             <option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }}</option>
@@ -772,11 +1050,24 @@ onUnmounted(() => {
           <p v-if="loadingChat" class="meta">正在加载对话…</p>
           <div v-else-if="!history.length" class="empty-thread">
             <span class="large-icon"><Sparkles :size="22" /></span>
-            <h2>{{ research ? '你想了解什么？' : ppt ? '想做什么主题的 PPT？' : word ? '想撰写什么 Word 文档？' : current.revision ? '这次想做什么？' : '你想做什么网站？' }}</h2>
-            <p>{{ research ? '可以直接提问，也可以让助手调研并生成带来源的报告。' : ppt ? '描述主题、受众、页数或风格要求，Agent 会先在浏览器完成排版检查再输出。' : word ? '描述文档主题、用途、章节或内容要求，Agent 会先完成 A4 排版检查再输出。' : current.revision ? '可以提问，也可以继续修改当前网站。' : '说说要实现的功能，生成后可以继续在这里修改。' }}</p>
+            <h2>{{ knowledge ? '想从资料中了解什么？' : research ? '你想了解什么？' : ppt ? '想做什么主题的 PPT？' : word ? '想撰写什么 Word 文档？' : current.revision ? '这次想做什么？' : '你想做什么网站？' }}</h2>
+            <p>{{ knowledge ? '文件解析完成后，可以提问并查看答案引用的原文。' : research ? '可以直接提问，也可以让助手调研并生成带来源的报告。' : ppt ? '描述主题、受众、页数或风格要求，Agent 会先在浏览器完成排版检查再输出。' : word ? '描述文档主题、用途、章节或内容要求，Agent 会先完成 A4 排版检查再输出。' : current.revision ? '可以提问，也可以继续修改当前网站。' : '说说要实现的功能，生成后可以继续在这里修改。' }}</p>
           </div>
           <div v-for="item in history" :key="item.id" class="message-pair">
-            <div class="user-message">{{ item.prompt }}</div>
+            <div class="user-turn">
+              <div v-if="item.attachments?.length" class="message-attachments" aria-label="本轮附带文件">
+                <button v-for="file in item.attachments" :key="file.id" type="button"
+                  class="message-attachment" :class="{ 'is-image': Boolean(file.thumbnail) }"
+                  :title="file.name + '（点击查看解析内容）'" @click="openAttachmentPreview(file)">
+                  <img v-if="file.thumbnail" :src="file.thumbnail" :alt="file.name" class="message-attachment-thumb">
+                  <template v-else>
+                    <FileText :size="15" />
+                    <span class="message-attachment-name">{{ file.name }}</span>
+                  </template>
+                </button>
+              </div>
+              <div class="user-message">{{ item.prompt }}</div>
+            </div>
             <div class="ai-message">
               <span class="ai-icon"><Sparkles :size="15" /></span>
               <div>
@@ -808,7 +1099,7 @@ onUnmounted(() => {
         </div>
         <div class="editor-area">
           <div v-if="activeModel?.source === 'platform' && !activeModel.available" class="model-note">
-            <CircleAlert :size="15" /><span>平台 DeepSeek 尚未配置。<button class="link" @click="showModels">添加自己的 Key</button><template v-if="demoModel && !research && !ppt && !word">，或<button class="link" @click="sample">试用待办演示</button>。</template></span>
+            <CircleAlert :size="15" /><span>平台 DeepSeek 尚未配置。<button class="link" @click="showModels">添加自己的 Key</button><template v-if="demoModel && current.kind === 'website'">，或<button class="link" @click="sample">试用待办演示</button>。</template></span>
           </div>
           <div v-else-if="activeModel?.source === 'demo'" class="model-note">
             <CircleAlert :size="15" /><span>离线样例只生成待办网站。<button class="link" @click="sample">{{ current.revision ? '填入修改示例' : '填入需求示例' }}</button></span>
@@ -817,19 +1108,57 @@ onUnmounted(() => {
             <CircleAlert :size="15" /><span>网页搜索尚未配置，可提供公开 HTTPS 链接或 API 地址。</span>
           </div>
           <p v-if="workspaceError || pollError" class="error" role="alert">{{ workspaceError || pollError }}</p>
-          <form class="composer" @submit.prevent="generate()">
-            <textarea v-model="prompt" @keydown.enter="sendOnEnter" :aria-label="research ? '调研主题' : ppt ? 'PPT 需求' : word ? 'Word 文档需求' : '建站需求'"
-              :placeholder="research ? '提问、继续讨论，或要求生成调研报告…' : ppt ? '描述 PPT 主题、页数、风格，或要求修改某一页…' : word ? '描述 Word 文档主题、章节、受众，或要求修改某一章…' : current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
+          <p v-if="supportsAttachments && attachmentError" class="error notice" role="alert">{{ attachmentError }}</p>
+          <p v-if="supportsAttachments && hasPendingAttachments" class="meta attachment-status-tip">
+            <LoaderCircle class="spin" :size="14" /> 附件正在上传或经 MinerU 解析，完成后可发送…
+          </p>
+          <form class="composer" :class="{ dragging: supportsAttachments && attachmentDragging }"
+            @submit.prevent="generate()"
+            @dragenter="onComposerDragEnter" @dragover="onComposerDragOver"
+            @dragleave="onComposerDragLeave" @drop="onComposerDrop">
+            <input v-if="supportsAttachments" ref="attachmentPicker" type="file" :accept="attachmentAccept" multiple hidden @change="onAttachmentInput">
+            <div v-if="supportsAttachments && attachmentDragging" class="composer-drop-hint">松开以上传文件到当前对话（单文件最大 10 MB）</div>
+            <div v-if="supportsAttachments && attachments.length" class="composer-attachments" aria-label="当前对话附件">
+              <div v-for="file in attachments" :key="file.id" class="attachment-chip" :class="'state-' + file.state"
+                :title="file.error ? file.name + '：' + file.error : file.name + '（' + formatFileSize(file.size) + '）'">
+                <button type="button" class="attachment-chip-main" :disabled="file.state !== 'ready'"
+                  :aria-label="file.state === 'ready' ? '查看 ' + file.name + ' 解析正文' : file.name"
+                  @click="openAttachmentPreview(file)">
+                  <img v-if="file.thumbnail" :src="file.thumbnail" :alt="file.name" class="attachment-chip-thumb">
+                  <LoaderCircle v-else-if="file.state === 'uploading' || file.state === 'parsing'" class="spin" :size="14" />
+                  <CircleAlert v-else-if="file.state === 'failed'" :size="14" />
+                  <FileText v-else :size="14" />
+                  <span class="attachment-chip-name">{{ file.name }}</span>
+                  <LoaderCircle v-if="file.thumbnail && (file.state === 'uploading' || file.state === 'parsing')" class="spin" :size="13" />
+                  <span v-if="file.state !== 'ready'" class="attachment-chip-state">{{ attachmentStatusLabel[file.state] }}</span>
+                </button>
+                <button type="button" class="attachment-chip-remove" :aria-label="'移除 ' + file.name"
+                  :disabled="removingAttachment === file.id" @click="removeAttachment(file)">
+                  <X :size="13" />
+                </button>
+              </div>
+            </div>
+            <textarea v-model="prompt" @keydown.enter="sendOnEnter" @paste="onComposerPaste"
+              :aria-label="knowledge ? '知识库问题' : research ? '调研主题' : ppt ? 'PPT 需求' : word ? 'Word 文档需求' : '建站需求'"
+              :placeholder="knowledge ? '根据上传的资料提问…' : research ? '提问、继续讨论，或粘贴/上传文件生成调研报告…' : ppt ? '描述 PPT 主题、页数、风格，或粘贴/上传参考文件…' : word ? '描述 Word 文档主题、章节、受众，或粘贴/上传参考文件…' : current.revision ? '提问、粘贴/上传文件，或描述你想修改的地方…' : '提问、粘贴/上传参考文件，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
             <div class="composer-actions">
               <div class="model-choice">
                 <select v-model="selectedModel" aria-label="调用模型">
                   <option v-for="model in workspaceModels" :key="model.id" :value="model.id">{{ modelLabel(model) }}</option>
                 </select>
                 <button class="icon" aria-label="打开模型设置" type="button" @click="showModels"><Settings2 :size="17" /></button>
+                <button v-if="supportsAttachments" class="quiet attach-trigger" type="button"
+                  :disabled="attachmentUploading || loadingChat"
+                  :title="attachmentMineru ? '上传或直接粘贴文件（Excel/Word/PPT/PDF/图片/文本，单文件最大 10 MB）' : '上传或粘贴文本文件（配置 MINERU_API_KEY 后支持 Office/PDF/图片）'"
+                  @click="attachmentPicker?.click()">
+                  <LoaderCircle v-if="attachmentUploading" class="spin" :size="15" />
+                  <Paperclip v-else :size="15" />
+                  <span>{{ attachmentUploading ? '上传中…' : '上传文件' }}</span>
+                </button>
               </div>
               <button v-if="activeGeneration && runningInAnotherChat" class="quiet" type="button" @click="selectChat(activeGeneration.chat_id ?? '')"><LoaderCircle class="spin" :size="14" /> 查看正在生成的对话</button>
               <button v-else-if="activeGeneration" class="stop-generation" type="button" :disabled="stopping || activeGeneration.agent_progress === '正在停止生成…'" @click="stopGeneration"><Square :size="14" /> {{ stopping || activeGeneration.agent_progress === '正在停止生成…' ? '正在停止…' : '停止生成' }}</button>
-              <button v-else class="primary send" type="submit" :disabled="!prompt.trim() || !activeModel?.available || sending || loadingChat"><Send :size="15" /> 发送</button>
+              <button v-else class="primary send" type="submit" :disabled="!prompt.trim() || !activeModel?.available || sending || loadingChat || hasPendingAttachments"><Send :size="15" /> 发送</button>
             </div>
           </form>
         </div>
@@ -843,6 +1172,7 @@ onUnmounted(() => {
       <ReportPane v-if="research" :project-id="current.id" :report-id="reportId" />
       <PptPane v-else-if="ppt" :project-id="current.id" :deck-id="reportId" />
       <WordPane v-else-if="word" :project-id="current.id" :doc-id="reportId" />
+      <KnowledgePane v-else-if="knowledge" :key="current.id" :project-id="current.id" />
       <section v-else class="result">
         <header class="pane-head result-head">
           <div class="tabs" aria-label="结果视图">
@@ -873,9 +1203,16 @@ onUnmounted(() => {
         </div>
         <div v-else-if="source" class="source-stage">
           <nav aria-label="项目文件">
+            <span class="source-nav-label">文件</span>
             <button v-for="file in fileNames" :key="file" :aria-pressed="sourceFile === file" @click="sourceFile = file"><FileCode2 :size="15" /> {{ file }}</button>
           </nav>
-          <pre aria-label="只读源码"><code>{{ source.files[sourceFile] }}</code></pre>
+          <section class="source-editor" aria-label="源码查看器">
+            <header class="source-file-heading"><FileCode2 :size="15" aria-hidden="true" /><span>{{ sourceFile }}</span></header>
+            <div :key="sourceFile" class="source-scroll" tabindex="0" aria-label="只读源码">
+              <span class="source-gutter" aria-hidden="true">{{ sourceLineNumbers }}</span>
+              <pre><code>{{ sourceText }}</code></pre>
+            </div>
+          </section>
         </div>
         <div v-else class="empty-preview">
           <span class="large-icon"><Code2 :size="26" /></span><h2>{{ current.revision ? '正在读取源码' : '还没有源码' }}</h2>
@@ -885,12 +1222,17 @@ onUnmounted(() => {
   </div>
 
   <div v-if="modal" class="modal-overlay" @click.self="closeModal" @keydown.esc="closeModal">
-    <section class="dialog" :class="{ 'model-dialog': modal === 'models' }" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+    <section class="dialog" :class="{ 'model-dialog': modal === 'models', 'attachment-dialog': modal === 'attachment' }" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
       <header class="dialog-heading">
-        <h2 id="dialog-title">{{ { create: newProjectKind === 'research' ? '新建调研' : newProjectKind === 'ppt' ? '新建 PPT' : newProjectKind === 'word' ? '新建 Word 文档' : '新建项目', rename: '重命名项目', delete: '删除项目', models: '模型设置', share: '分享预览' }[modal] }}</h2>
+        <h2 id="dialog-title">{{ { create: projectCategories.find(category => category.kind === newProjectKind)?.createLabel, rename: '重命名项目', delete: '删除项目', models: '模型设置', share: '分享预览', attachment: previewAttachment?.name || '附件解析内容' }[modal] }}</h2>
         <button class="icon" aria-label="关闭" @click="closeModal"><X :size="20" /></button>
       </header>
-      <template v-if="modal === 'share'">
+      <template v-if="modal === 'attachment' && previewAttachment">
+        <img v-if="previewAttachment.thumbnail" :src="previewAttachment.thumbnail" :alt="previewAttachment.name" class="attachment-preview-image">
+        <p class="meta">共 {{ previewAttachment.text.length }} 字符 · 点击关闭返回对话</p>
+        <pre class="attachment-preview-text">{{ previewAttachment.text }}</pre>
+      </template>
+      <template v-else-if="modal === 'share'">
         <p class="description">知道链接的人可以打开并操作预览，无需登录。访客使用独立数据，链接创建后 24 小时失效。</p>
         <div v-if="shareLink" class="stack">
           <label>分享链接
@@ -930,13 +1272,13 @@ onUnmounted(() => {
         </form>
       </template>
       <form v-else class="stack" @submit.prevent="saveProject">
-        <p v-if="modal === 'delete'">确定删除「{{ target?.name }}」吗？{{ target?.kind === 'research' ? '该项目的对话和报告将一起删除。' : target?.kind === 'ppt' ? '该项目的对话和所有 PPT 版本将一起删除。' : target?.kind === 'word' ? '该项目的对话和所有 Word 文档版本将一起删除。' : '该项目的对话、源码和预览数据将一起删除。' }}</p>
-        <label v-else>项目名称<input ref="nameInput" v-model.trim="name" required maxlength="60" :placeholder="newProjectKind === 'research' ? '例如：行业趋势调研' : newProjectKind === 'ppt' ? '例如：Q3 产品战略汇报' : newProjectKind === 'word' ? '例如：2026 年度数字化实施方案' : '例如：每日待办'"></label>
+        <p v-if="modal === 'delete'">确定删除「{{ target?.name }}」吗？{{ target?.kind === 'knowledge' ? '该知识库的对话和文件解析内容将一起删除。' : target?.kind === 'research' ? '该项目的对话和报告将一起删除。' : target?.kind === 'ppt' ? '该项目的对话和所有 PPT 版本将一起删除。' : target?.kind === 'word' ? '该项目的对话和所有 Word 文档版本将一起删除。' : '该项目的对话、源码和预览数据将一起删除。' }}</p>
+        <label v-else>项目名称<input ref="nameInput" v-model.trim="name" required maxlength="60" :placeholder="newProjectKind === 'knowledge' ? '例如：公司制度' : newProjectKind === 'research' ? '例如：行业趋势调研' : newProjectKind === 'ppt' ? '例如：Q3 产品战略汇报' : newProjectKind === 'word' ? '例如：2026 年度数字化实施方案' : '例如：每日待办'"></label>
         <p v-if="modalError" class="error" role="alert">{{ modalError }}</p>
         <div class="dialog-actions">
           <button type="button" @click="closeModal">取消</button>
           <button v-if="modal === 'delete'" class="danger" :disabled="busy" type="submit">删除项目</button>
-          <button v-else class="primary" :disabled="busy" type="submit">{{ modal === 'create' ? newProjectKind === 'research' ? '创建调研' : newProjectKind === 'ppt' ? '创建 PPT' : newProjectKind === 'word' ? '创建 Word' : '创建项目' : '保存' }}</button>
+          <button v-else class="primary" :disabled="busy" type="submit">{{ modal === 'create' ? newProjectKind === 'knowledge' ? '创建知识库' : newProjectKind === 'research' ? '创建调研' : newProjectKind === 'ppt' ? '创建 PPT' : newProjectKind === 'word' ? '创建 Word' : '创建项目' : '保存' }}</button>
         </div>
       </form>
     </section>

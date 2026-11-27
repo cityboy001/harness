@@ -11,6 +11,7 @@ import {
   normalizeWordTheme
 } from './word-doc.mjs';
 import { inspectWordInBrowser } from './word-export.mjs';
+import { attachmentToolLimit, createAttachmentContext } from './attachments.mjs';
 
 const docDigest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
@@ -168,6 +169,7 @@ export async function runWordTurn({
   prompt,
   previousDoc,
   recent = [],
+  attachments = [],
   completion,
   search,
   read,
@@ -220,8 +222,16 @@ export async function runWordTurn({
   let verifiedSnapshot = null;
 
   const web = search ? createWebResearchTools({ search, read, signal, onActivity: activity }) : null;
-  const definitions = [...wordTools, ...(web ? web.definitions : [])];
+  const attachmentCtx = createAttachmentContext(attachments, { allowTools: true, onActivity: activity });
+  const definitions = [
+    ...wordTools,
+    ...(web ? web.definitions : []),
+    ...(attachmentCtx?.toolDefinition ? [attachmentCtx.toolDefinition] : [])
+  ];
   const handlers = new Map(web ? web.handlers : []);
+  if (attachmentCtx?.toolDefinition) {
+    handlers.set(attachmentCtx.toolDefinition.function.name, (args) => attachmentCtx.handler(args));
+  }
 
   handlers.set('set_doc_meta', async ({ title, subtitle, headerText, showCover, showToc, showHeaderFooter, meta, theme }) => {
     let nextMeta = draft.meta;
@@ -356,10 +366,11 @@ export async function runWordTurn({
     });
   });
 
-  const userPayload = previousDoc || recent.length
+  const userPayload = previousDoc || recent.length || attachmentCtx
     ? JSON.stringify({
         request: prompt,
         recentDialogue: recent,
+        ...(attachmentCtx ? { uploadedAttachments: attachmentCtx.promptText } : {}),
         currentDoc: previousDoc
           ? {
               title: previousDoc.title,
@@ -382,7 +393,7 @@ export async function runWordTurn({
     : prompt;
 
   const messages = [
-    { role: 'system', content: wordSystemPrompt },
+    { role: 'system', content: wordSystemPrompt + (attachmentCtx ? '\n\n' + attachmentCtx.instructions : '') },
     { role: 'user', content: userPayload }
   ];
 
@@ -395,10 +406,10 @@ export async function runWordTurn({
     completion,
     signal,
     maxTokens,
-    maxToolTurns: 24,
+    maxToolTurns: 24 + (attachmentCtx?.toolDefinition ? attachmentToolLimit : 0),
     maxCallsPerTurn: 12,
     onReasoning,
-    progress: () => toolOps + (web?.calls ?? 0),
+    progress: () => toolOps + (web?.calls ?? 0) + (attachmentCtx?.calls ?? 0),
     finishInstructions,
     finalize(text) {
       const cleaned = text.trim().replace(/^```(?:json)?\s*|\s*```$/giu, '');

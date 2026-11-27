@@ -21,6 +21,10 @@ import { quickPptReply, runPptTurn } from './ppt.mjs';
 import { normalizeWordDoc } from './word-doc.mjs';
 import { exportWordToDocx, exportWordToPdf } from './word-export.mjs';
 import { quickWordReply, runWordTurn } from './word.mjs';
+import { answerKnowledge, makeKnowledgeParser } from './knowledge.mjs';
+import { registerKnowledgeRoutes } from './knowledge-routes.mjs';
+import { makeDocumentParser } from './document-parser.mjs';
+import { registerAttachmentRoutes } from './attachments.mjs';
 
 const id = () => randomUUID().replaceAll('-', '');
 const dayKey = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
@@ -31,12 +35,14 @@ const selectProjects = `SELECT projects.*, CASE
   WHEN research_projects.project_id IS NOT NULL THEN 'research'
   WHEN ppt_projects.project_id IS NOT NULL THEN 'ppt'
   WHEN word_projects.project_id IS NOT NULL THEN 'word'
+  WHEN knowledge_projects.project_id IS NOT NULL THEN 'knowledge'
   ELSE 'website'
 END AS kind
   FROM projects
   LEFT JOIN research_projects ON research_projects.project_id = projects.id
   LEFT JOIN ppt_projects ON ppt_projects.project_id = projects.id
-  LEFT JOIN word_projects ON word_projects.project_id = projects.id`;
+  LEFT JOIN word_projects ON word_projects.project_id = projects.id
+  LEFT JOIN knowledge_projects ON knowledge_projects.project_id = projects.id`;
 
 function field(value, label, max, min = 1) {
   const result = typeof value === 'string' ? value.trim() : '';
@@ -259,9 +265,18 @@ export async function createApp(config) {
   });
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof PublicError) return reply.code(error.statusCode).send({ error: error.message });
+    if (error.statusCode === 413) return reply.code(413).send({ error: '文件或请求内容超过大小限制。' });
     if (error.statusCode && error.statusCode < 500) return reply.code(error.statusCode).send({ error: '请求格式无效。' });
     app.log.error({ name: error.name, code: error.code }, 'Unhandled request error');
     return reply.code(500).send({ error: '服务暂时不可用，请稍后重试。' });
+  });
+  registerKnowledgeRoutes(app, {
+    root: prefix + '/api', store, ownedProject, newId: id, limit,
+    parser: makeKnowledgeParser(config.mineruKey, config.mineruFetch)
+  });
+  registerAttachmentRoutes(app, {
+    root: prefix + '/api', store, ownedProject, projectChat, newId: id, limit,
+    parser: makeDocumentParser(config.mineruKey, config.mineruFetch)
   });
   route('GET', '/session', async (request) => ({ user: store.session(sessionKey(request)) ?? null, platform }));
   route('POST', '/register', async (request, reply) => {
@@ -297,7 +312,7 @@ export async function createApp(config) {
     const owner = user(request).id;
     const name = field(request.body?.name, '项目名称', 60);
     const kind = request.body?.kind ?? 'website';
-    if (!['website', 'research', 'ppt', 'word'].includes(kind)) throw new PublicError(400, '项目类型无效。');
+    if (!['website', 'research', 'ppt', 'word', 'knowledge'].includes(kind)) throw new PublicError(400, '项目类型无效。');
     if (store.get('SELECT count(*) AS count FROM projects WHERE user_id = ?', owner).count >= 30) throw new PublicError(409, '项目数量已达上限。');
     const item = { id: id(), name, kind, user_id: owner, updated: Date.now(), active_revision: null };
     store.transaction(() => {
@@ -305,6 +320,7 @@ export async function createApp(config) {
       if (kind === 'research') store.run('INSERT INTO research_projects VALUES (?)', item.id);
       if (kind === 'ppt') store.run('INSERT INTO ppt_projects VALUES (?)', item.id);
       if (kind === 'word') store.run('INSERT INTO word_projects VALUES (?)', item.id);
+      if (kind === 'knowledge') store.run('INSERT INTO knowledge_projects VALUES (?)', item.id);
     });
     return reply.code(201).send(projectView(item));
   });
@@ -319,8 +335,23 @@ export async function createApp(config) {
         WHERE r.message_id = messages.id AND r.base_revision IS ? AND r.draft_files IS NOT NULL) AS has_checkpoint FROM messages
       LEFT JOIN message_reasoning ON message_reasoning.message_id = messages.id
       WHERE project_id = ? AND chat_id IS ? ORDER BY created, messages.rowid`, item.active_revision, item.id, chat);
+    const attachedRows = item.kind === 'knowledge' ? [] : store.all(
+      `SELECT id, message_id, name, size, created, state, error, thumbnail FROM chat_attachments
+       WHERE project_id = ? AND chat_id IS ? AND message_id IS NOT NULL
+       ORDER BY created ASC, rowid ASC`,
+      item.id, chat
+    );
+    const attachmentsByMessage = new Map();
+    for (const row of attachedRows) {
+      const { message_id: mid, ...meta } = row;
+      const list = attachmentsByMessage.get(mid);
+      if (list) list.push(meta);
+      else attachmentsByMessage.set(mid, [meta]);
+    }
     return { project: projectView(item), chats, activeGeneration, researchSearchAvailable: Boolean(config.searchWeb ?? config.deepseekKey), messages: records.map(({ agent_events, ...record }) => ({
-      ...record, agent_events: agent_events ? JSON.parse(agent_events) : []
+      ...record,
+      agent_events: agent_events ? JSON.parse(agent_events) : [],
+      attachments: attachmentsByMessage.get(record.id) ?? []
     })) };
   });
   route('POST', '/projects/:id/chats', async (request, reply) => {
@@ -356,7 +387,10 @@ export async function createApp(config) {
     let shared;
     await preview.delete(item.id, () => {
       ownedProject(request);
-      const revisions = store.all('SELECT id FROM revisions WHERE project_id = ?', item.id);
+      const revisions = store.all(`SELECT id FROM revisions WHERE project_id = ?
+        UNION SELECT draft_id AS id FROM generation_runs
+        JOIN messages ON messages.id = generation_runs.message_id
+        WHERE messages.project_id = ? AND draft_id IS NOT NULL`, item.id, item.id);
       shared = store.get('SELECT id FROM shares WHERE project_id = ?', item.id);
       store.run('DELETE FROM projects WHERE id = ?', item.id);
       return revisions;
@@ -487,6 +521,7 @@ export async function createApp(config) {
     const research = item.kind === 'research';
     const ppt = item.kind === 'ppt';
     const word = item.kind === 'word';
+    const knowledge = item.kind === 'knowledge';
     const chat = projectChat(item.id, request.body?.chatId);
     const resumeId = request.body?.resumeMessageId == null ? null : field(request.body.resumeMessageId, '生成记录', 64);
     const resume = resumeId && store.get(`SELECT m.*, r.base_revision, r.draft_files FROM messages m JOIN generation_runs r ON r.message_id = m.id
@@ -498,7 +533,16 @@ export async function createApp(config) {
     const prompt = resume ? resume.prompt : field(request.body?.prompt, '需求', 6000);
     const quickReply = research ? quickResearchReply(prompt) : ppt ? quickPptReply(prompt) : word ? quickWordReply(prompt) : undefined;
     const modelId = resume ? resume.model_id : field(request.body?.modelId ?? 'platform', '模型', 64);
-    if ((research || ppt || word) && modelId === 'demo') throw new PublicError(400, research ? '请选择支持联网调研的模型。' : '请选择支持对话生成的模型。');
+    if (item.kind !== 'website' && modelId === 'demo') throw new PublicError(400, research ? '请选择支持联网调研的模型。' : '请选择支持对话生成的模型。');
+    if (knowledge && !store.get("SELECT id FROM knowledge_files WHERE project_id = ? AND state = 'ready' LIMIT 1", item.id)) {
+      throw new PublicError(409, '请先上传文件并等待解析完成。');
+    }
+    if (!knowledge && !resume && store.get(
+      "SELECT id FROM chat_attachments WHERE project_id = ? AND chat_id IS ? AND message_id IS NULL AND state IN ('uploading', 'parsing') LIMIT 1",
+      item.id, chat
+    )) {
+      throw new PublicError(409, '当前对话有文件正在解析中，请等待解析完成后再发送。');
+    }
     const model = modelConfig(modelId, item.user_id);
     const web = config.searchWeb === undefined && isDeepSeek(model) ? deepSeekWebTools(model.key) : undefined;
     const search = config.searchWeb ?? web?.search;
@@ -521,11 +565,22 @@ export async function createApp(config) {
       const now = Date.now();
       store.run('INSERT INTO messages (id, project_id, chat_id, prompt, model_id, model_name, state, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         messageId, item.id, chat, prompt, modelId, model.name, 'running', now);
-      if (modelId !== 'demo' && !research && !ppt && !word) store.run('INSERT INTO generation_runs (message_id, base_revision) VALUES (?, ?)', messageId, item.active_revision);
+      if (!knowledge) {
+        // 将本轮待发送的已就绪附件绑定到该条用户消息，发送后从输入框清空
+        store.run(
+          "UPDATE chat_attachments SET message_id = ? WHERE project_id = ? AND chat_id IS ? AND message_id IS NULL AND state = 'ready'",
+          messageId, item.id, chat
+        );
+      }
+      if (modelId !== 'demo' && item.kind === 'website') store.run('INSERT INTO generation_runs (message_id, base_revision) VALUES (?, ?)', messageId, item.active_revision);
       if (chat) store.run('UPDATE project_chats SET title = ? WHERE id = ? AND title IS NULL',
         [...prompt.replace(/\s+/gu, ' ')].slice(0, 32).join(''), chat);
       store.run('UPDATE projects SET updated = ? WHERE id = ?', now, item.id);
     });
+    const attachments = knowledge ? [] : store.all(
+      "SELECT id, message_id, name, size, text FROM chat_attachments WHERE project_id = ? AND chat_id IS ? AND state = 'ready' ORDER BY created ASC, rowid ASC",
+      item.id, chat
+    ).map((row) => ({ ...row, currentTurn: row.message_id === messageId }));
     const controller = new AbortController();
     const { signal } = controller;
     const task = (async () => {
@@ -573,6 +628,20 @@ export async function createApp(config) {
         lastReasoningWrite = Date.now();
       };
       try {
+        if (knowledge) {
+          const files = store.all("SELECT name, text FROM knowledge_files WHERE project_id = ? AND state = 'ready' ORDER BY created DESC", item.id);
+          const recent = store.all(`SELECT substr(prompt, 1, 700) AS request, substr(response, 1, 900) AS answer FROM messages
+            WHERE project_id = ? AND chat_id IS ? AND state = 'complete' ORDER BY created DESC, rowid DESC LIMIT 3`, item.id, chat).reverse();
+          store.run('UPDATE messages SET agent_progress = ? WHERE id = ?', '正在查找文件中的相关内容…', messageId);
+          const answer = await answerKnowledge({ files, prompt, recent, signal,
+            complete: (messages, maxTokens, options) => retryModelCompletion(completion, model, messages, maxTokens, options) });
+          signal.throwIfAborted();
+          store.transaction(() => {
+            store.run("UPDATE messages SET state = 'complete', result_type = 'answer', response = ?, agent_progress = NULL WHERE id = ?", answer, messageId);
+            store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+          });
+          return;
+        }
         if (research) {
           const previous = !quickReply && store.all(`SELECT messages.prompt, reports.html FROM reports JOIN messages ON messages.id = reports.message_id
             WHERE project_id = ? AND chat_id IS ? ORDER BY messages.created DESC, messages.rowid DESC LIMIT 6`, item.id, chat)
@@ -585,7 +654,7 @@ export async function createApp(config) {
           };
           onProgress('正在理解请求…');
           const result = quickReply ? { type: 'answer', text: quickReply } : await runResearchTurn({
-            prompt, previous: previous?.html.slice(0, 24000), recent, search, read,
+            prompt, previous: previous?.html.slice(0, 24000), recent, attachments, search, read,
             fetchCodePage: config.fetchResearchCodePage, signal, onProgress, onActivity,
             maxTokens: isDeepSeek(model) ? (config.deepseekMaxTokens ?? 64000) : (config.maxTokens ?? 10000),
             completion: (messages, maxTokens, options) => retryModelCompletion(completion, model, messages, maxTokens, options)
@@ -622,7 +691,7 @@ export async function createApp(config) {
           };
           onProgress('正在规划 PPT 结构与视觉主题…');
           const result = quickReply ? { type: 'answer', text: quickReply } : await runPptTurn({
-            prompt, previousDeck, recent, search, read, signal, onProgress, onActivity, onReasoning,
+            prompt, previousDeck, recent, attachments, search, read, signal, onProgress, onActivity, onReasoning,
             maxTokens: isDeepSeek(model) ? (config.deepseekMaxTokens ?? 64000) : (config.maxTokens ?? 10000),
             completion: (messages, maxTokens, options) => retryModelCompletion(completion, model, messages, maxTokens, options)
           });
@@ -659,7 +728,7 @@ export async function createApp(config) {
           };
           onProgress('正在规划 Word 文档结构与样式…');
           const result = quickReply ? { type: 'answer', text: quickReply } : await runWordTurn({
-            prompt, previousDoc, recent, search, read, signal, onProgress, onActivity, onReasoning,
+            prompt, previousDoc, recent, attachments, search, read, signal, onProgress, onActivity, onReasoning,
             maxTokens: isDeepSeek(model) ? (config.deepseekMaxTokens ?? 64000) : (config.maxTokens ?? 10000),
             completion: (messages, maxTokens, options) => retryModelCompletion(completion, model, messages, maxTokens, options)
           });
@@ -705,7 +774,7 @@ export async function createApp(config) {
           });
         };
         const output = await buildWebsite(model, request, draftFiles ?? baseline, provider, {
-            memory, signal, timeoutMs: config.generationTimeoutMs, react: true, runCode: makeCodeRunner(config.codeLauncher),
+            memory, attachments, signal, timeoutMs: config.generationTimeoutMs, react: true, runCode: makeCodeRunner(config.codeLauncher),
             search, readWebPage: read,
             testBrowser, requireBrowser: Boolean(testBrowser) && modelId !== 'demo',
             resumeDraft: Boolean(draftFiles), comparisonFiles: baseline ?? null,

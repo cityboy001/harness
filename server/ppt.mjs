@@ -4,6 +4,7 @@ import { runReAct } from './react-agent.mjs';
 import { createWebResearchTools } from './web-research.mjs';
 import { DEFAULT_PPT_THEME, MAX_SLIDES, normalizeDeck, normalizeSlide, normalizeTheme, VALID_LAYOUTS, VALID_TRANSITIONS } from './ppt-deck.mjs';
 import { inspectDeckInBrowser } from './ppt-export.mjs';
+import { attachmentToolLimit, createAttachmentContext } from './attachments.mjs';
 
 const deckDigest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
@@ -161,6 +162,7 @@ export async function runPptTurn({
   prompt,
   previousDeck,
   recent = [],
+  attachments = [],
   completion,
   search,
   read,
@@ -196,8 +198,16 @@ export async function runPptTurn({
   let verifiedSnapshot = null; // { id, digest, deck }
 
   const web = search ? createWebResearchTools({ search, read, signal, onActivity: activity }) : null;
-  const definitions = [...pptTools, ...(web ? web.definitions : [])];
+  const attachmentCtx = createAttachmentContext(attachments, { allowTools: true, onActivity: activity });
+  const definitions = [
+    ...pptTools,
+    ...(web ? web.definitions : []),
+    ...(attachmentCtx?.toolDefinition ? [attachmentCtx.toolDefinition] : [])
+  ];
   const handlers = new Map(web ? web.handlers : []);
+  if (attachmentCtx?.toolDefinition) {
+    handlers.set(attachmentCtx.toolDefinition.function.name, (args) => attachmentCtx.handler(args));
+  }
 
   handlers.set('set_deck_theme', async ({ title, theme }) => {
     if (typeof title === 'string' && title.trim()) {
@@ -305,10 +315,11 @@ export async function runPptTurn({
     });
   });
 
-  const userPayload = previousDeck || recent.length
+  const userPayload = previousDeck || recent.length || attachmentCtx
     ? JSON.stringify({
         request: prompt,
         recentDialogue: recent,
+        ...(attachmentCtx ? { uploadedAttachments: attachmentCtx.promptText } : {}),
         currentDeck: previousDeck
           ? {
               title: previousDeck.title,
@@ -330,7 +341,7 @@ export async function runPptTurn({
     : prompt;
 
   const messages = [
-    { role: 'system', content: pptSystemPrompt },
+    { role: 'system', content: pptSystemPrompt + (attachmentCtx ? '\n\n' + attachmentCtx.instructions : '') },
     { role: 'user', content: userPayload }
   ];
 
@@ -343,10 +354,10 @@ export async function runPptTurn({
     completion,
     signal,
     maxTokens,
-    maxToolTurns: 24,
+    maxToolTurns: 24 + (attachmentCtx?.toolDefinition ? attachmentToolLimit : 0),
     maxCallsPerTurn: 12,
     onReasoning,
-    progress: () => toolOps + (web?.calls ?? 0),
+    progress: () => toolOps + (web?.calls ?? 0) + (attachmentCtx?.calls ?? 0),
     finishInstructions,
     finalize(text) {
       const cleaned = text.trim().replace(/^```(?:json)?\s*|\s*```$/giu, '');
