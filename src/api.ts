@@ -22,7 +22,7 @@ export function message(error: unknown) {
 }
 
 export interface User { id: string; name: string }
-export type ProjectKind = 'website' | 'research';
+export type ProjectKind = 'website' | 'research' | 'ppt' | 'word';
 export interface Project { id: string; name: string; kind: ProjectKind; updated: number; revision: string | null; draftRevision?: string | null; hasSavedDraft?: boolean; preview: 'starting' | 'running' | 'stopped' }
 export interface Model { id: string; name: string; model: string; source: 'platform' | 'custom' | 'demo'; available: boolean; baseUrl?: string }
 export type AgentRole = 'central' | 'frontend' | 'backend' | 'browser' | 'direct' | 'analyze' | 'read_project' | 'edit_project';
@@ -49,7 +49,7 @@ export type AgentEvent =
   | { kind: 'activity'; taskId?: string; detail: string; decision?: string; details?: string }
   | { kind: 'progress'; detail: string; details?: string; taskId?: never; decision?: never }
   | { kind: 'acceptance'; taskId?: string; candidateDigest: string; round: number; items: AcceptanceItem[] };
-export interface Conversation { id: string; prompt: string; model_id: string; model_name: string; state: 'running' | 'failed' | 'complete' | 'stopped'; response: string | null; created: number; has_reasoning: 0 | 1; has_checkpoint?: 0 | 1; result_type: 'answer' | 'revision' | 'report' | null; agent_progress: string | null; agent_events?: AgentEvent[] }
+export interface Conversation { id: string; prompt: string; model_id: string; model_name: string; state: 'running' | 'failed' | 'complete' | 'stopped'; response: string | null; created: number; has_reasoning: 0 | 1; has_checkpoint?: 0 | 1; result_type: 'answer' | 'revision' | 'report' | 'ppt' | 'word' | null; agent_progress: string | null; agent_events?: AgentEvent[] }
 export interface ProjectChat { id: string; title: string }
 export interface ProjectWorkspace {
   project: Project;
@@ -59,6 +59,79 @@ export interface ProjectWorkspace {
   activeGeneration: { id: string; chat_id: string | null; agent_progress: string | null } | null;
 }
 export interface ResearchReport { html: string; version: number }
+export interface PptTheme {
+  name: string;
+  primary: string;
+  secondary: string;
+  surface: string;
+  accent: string;
+  text: string;
+  muted: string;
+  onPrimary: string;
+  fontFamily: string;
+}
+export type PptTransition = 'none' | 'fade' | 'push' | 'wipe' | 'zoom';
+export interface PptSlide {
+  index: number;
+  title: string;
+  layout: string;
+  tone: 'dark' | 'light';
+  transition?: PptTransition;
+  html: string;
+  notes: string;
+}
+export interface PptDeck {
+  templateId: string;
+  title: string;
+  theme: PptTheme;
+  slides: PptSlide[];
+}
+export interface PptDeckRecord { deck: PptDeck; version: number }
+export interface WordTheme {
+  name: string;
+  primary: string;
+  accent: string;
+  surface: string;
+  text: string;
+  muted: string;
+  border: string;
+  fontPreset?: 'sans' | 'serif' | 'fangsong' | 'kaiti';
+  fontSize?: number;
+  lineHeight?: number;
+  paragraphSpacing?: number;
+  pageMargin?: 'narrow' | 'normal' | 'wide';
+  headingStyle?: 'underline' | 'bar' | 'plain' | 'center';
+  firstLineIndent?: boolean;
+  tableDensity?: 'compact' | 'normal' | 'relaxed';
+  fontFamily: string;
+  headingFontFamily?: string;
+}
+export interface WordMeta {
+  author: string;
+  organization: string;
+  date: string;
+  docNo: string;
+  category: string;
+}
+export interface WordSection {
+  index: number;
+  title: string;
+  html: string;
+  pageBreakBefore: boolean;
+}
+export interface WordDoc {
+  templateId: string;
+  title: string;
+  subtitle: string;
+  headerText: string;
+  showCover: boolean;
+  showToc: boolean;
+  showHeaderFooter?: boolean;
+  meta: WordMeta;
+  theme: WordTheme;
+  sections: WordSection[];
+}
+export interface WordDocRecord { doc: WordDoc; version: number }
 export interface Revision { revision: string; version: number; files: Record<string, string> }
 export interface SharedRevision extends Revision { name: string }
 export interface ShareLink { url: string; expires: number; version: number; current: boolean }

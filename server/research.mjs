@@ -51,7 +51,7 @@ const layoutInstructions = `使用有信息层次的可编辑 HTML 排版，开�
 - 只要有两项以上同口径、同单位的可比非负数，就应把第一张横向条形图放在封面和指标卡之后、详细正文和表格之前。<figure class="report-chart"><figcaption>比较标题和单位</figcaption><div class="report-bar"><p>系列名称 <strong>显示的数值</strong></p><meter min="0" max="共同上限" value="真实数值" aria-label="系列名称"></meter></div></figure>。每条使用相同的数值上限，标签保留实际值。季度或期间长短不同时不要直接比较总量。
 - 有时间顺序的事项可用 <ol class="report-timeline"><li><strong>日期</strong><p>事件</p></li></ol>。
 - 用 h2 划分正文。资料链接可放在 <section class="report-sources"><h2>资料来源</h2><ul>…</ul></section>，用来源名称作链接文字。
-输出上述 HTML 结构。页面统一提供组件样式，保持正文和链接可编辑。`;
+输出上述 HTML 结构，整段回复只包含这段 HTML，从标签开始。不要加导语，不要用 Markdown 代码围栏。页面统一提供组件样式，保持正文和链接可编辑。`;
 
 export function reportDocument(html) {
   return `<!doctype html>
@@ -92,6 +92,40 @@ function reportLinks(html) {
   return links;
 }
 
+const reportStart = /^(?:<!doctype\b|<html\b|<header\b|<h1\b|<h2\b|<section\b|<article\b|<div\b|<p\b)/i;
+const reportMarker = /class="report-|<(?:h1|h2)\b|href="/i;
+
+// 模型常在正文前写说明，并用 ```html 围栏包住报告。围栏不在开头时仍要取出 HTML，否则整段会变成对话文本。
+function reportDelivery(text) {
+  const trimmed = text.trim();
+  const bare = trimmed.replace(/^```(?:html)?\s*|\s*```$/gi, '').trim();
+  if (reportStart.test(bare)) return { fragment: bare, intro: '' };
+  const blocks = [...trimmed.matchAll(/```[ \t]*html\s*([\s\S]*?)```/gi)];
+  let chosen = null;
+  for (const match of blocks) {
+    const fragment = match[1].trim();
+    if (!reportStart.test(fragment) || !reportMarker.test(fragment)) continue;
+    if (!chosen || fragment.length > chosen.fragment.length) chosen = { fragment, match };
+  }
+  if (!chosen && !/```[ \t]*html\s*[\s\S]*?```/i.test(trimmed)) {
+    const match = trimmed.match(/```[ \t]*html\s*([\s\S]+)$/i);
+    const fragment = match?.[1].trim();
+    if (match && fragment && reportStart.test(fragment) && reportMarker.test(fragment)) chosen = { fragment, match };
+  }
+  if (chosen) {
+    const before = trimmed.slice(0, chosen.match.index).trim();
+    const after = trimmed.slice(chosen.match.index + chosen.match[0].length).trim();
+    return { fragment: chosen.fragment, intro: [before, after].filter(Boolean).join('\n\n') };
+  }
+  const inline = trimmed.match(/(^|[\r\n])(<(?:!doctype\b|html\b|header\b|h1\b)[\s\S]*)$/i);
+  const fragment = inline?.[2].trim();
+  const tags = fragment?.match(/<\/?(?:header|h1|h2|h3|section|p|a|figure|table)\b/gi);
+  if (inline && fragment && inline.index > 0 && reportMarker.test(fragment) && (tags?.length ?? 0) >= 4) {
+    return { fragment, intro: trimmed.slice(0, inline.index).trim() };
+  }
+  return null;
+}
+
 export async function runResearchTurn({ prompt, previous, recent = [], completion, search, read, fetchCodePage, signal, maxTokens, onProgress, onActivity }) {
   const activity = (detail, decision) => {
     onProgress?.(detail);
@@ -118,7 +152,7 @@ export async function runResearchTurn({ prompt, previous, recent = [], completio
       return JSON.stringify({ error: '代码沙盒启动或执行失败。' });
     }
   });
-  const finishInstructions = '结束工具调用并直接回答用户。普通对话返回回复文字。只有用户要求交付或更新报告时才返回带来源链接的 HTML 正文片段。';
+  const finishInstructions = '结束工具调用并直接回答用户。普通对话返回回复文字。只有用户要求交付或更新报告时才返回带来源链接的 HTML 正文片段，从标签开始，不要加导语或 Markdown 代码围栏。';
   const sourceInstructions = search
     ? '优先用网页搜索发现资料，也可以运行代码读取公开数据或官方 API。'
     : '本环境未配置网页搜索。用 run_code 和 fetch 访问用户提供的公开链接或已知的官方 API 和数据源。';
@@ -140,17 +174,18 @@ export async function runResearchTurn({ prompt, previous, recent = [], completio
         if (typeof value?.answer !== 'string' || !value.answer.trim()) throw new PublicError(422, '对话回复需要包含非空 answer。');
         return { type: 'answer', text: value.answer.trim().slice(0, 8000) };
       }
-      const fragment = text.trim().replace(/^```html\s*|\s*```$/gu, '');
-      if (!/^<(?:!doctype\b|html\b|header\b|h1\b|h2\b|section\b|article\b|div\b|p\b)/i.test(fragment)) {
+      const delivery = reportDelivery(text);
+      if (!delivery) {
         if (!reply) throw new PublicError(422, '对话回复为空，请重试。');
         return { type: 'answer', text: reply.slice(0, 8000) };
       }
-      const html = cleanReport(text);
+      const html = cleanReport(delivery.fragment);
       const previousSources = previous ? reportLinks(previous) : new Set();
       if (![...reportLinks(html)].some(url => sources.has(url) || previousSources.has(url))) {
         throw new PublicError(422, (web.error && !sources.size ? web.error.message + ' ' : '') + '报告需要引用已核实的来源。');
       }
-      return { type: 'report', html };
+      const intro = delivery.intro.trim().slice(0, 8000);
+      return intro ? { type: 'report', html, text: intro } : { type: 'report', html };
     },
     correction(error) {
       return { kind: 'report', message: error.message + ' 普通问题直接返回 answer。只有需要外部资料时才调用工具；修订可沿用已有来源。',

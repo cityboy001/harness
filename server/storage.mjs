@@ -76,6 +76,20 @@ export function openStore(root, encryptionKey) {
       message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
       html TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS ppt_projects (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS ppt_decks (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      deck TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS word_projects (
+      project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS word_docs (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      doc TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
+    );
     CREATE TABLE IF NOT EXISTS project_memory (
       project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
       through_rowid INTEGER NOT NULL, summary TEXT NOT NULL, updated INTEGER NOT NULL

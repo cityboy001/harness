@@ -1,0 +1,309 @@
+/* PPT 幻灯片统一基础样式（供前端预览、Playwright 排版检查和 PPTX/PDF 导出共用） */
+.ppt-slide {
+  --ppt-primary: #1e2761;
+  --ppt-secondary: #f4f6fa;
+  --ppt-surface: #ffffff;
+  --ppt-accent: #00a896;
+  --ppt-text: #1f2937;
+  --ppt-muted: #64748b;
+  --ppt-on-primary: #ffffff;
+  --ppt-border: #dce3ee;
+  --ppt-font: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", Arial, sans-serif;
+  position: relative;
+  width: 1280px;
+  height: 720px;
+  overflow: hidden;
+  box-sizing: border-box;
+  font-family: var(--ppt-font);
+  font-size: 19px;
+  line-height: 1.5;
+  color: var(--ppt-text);
+  background-color: var(--ppt-secondary);
+  -webkit-font-smoothing: antialiased;
+}
+
+.ppt-slide *,
+.ppt-slide *::before,
+.ppt-slide *::after {
+  box-sizing: border-box;
+}
+
+.ppt-slide--dark {
+  background-color: var(--ppt-primary);
+  color: var(--ppt-on-primary);
+}
+
+.ppt-slide--light {
+  background-color: var(--ppt-secondary);
+  color: var(--ppt-text);
+}
+
+.ppt-slide-inner {
+  width: 100%;
+  height: 100%;
+  padding: 52px 64px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.ppt-slide h1,
+.ppt-slide h2,
+.ppt-slide h3,
+.ppt-slide h4,
+.ppt-slide p,
+.ppt-slide ul,
+.ppt-slide ol {
+  margin: 0;
+}
+
+.ppt-slide h1 {
+  font-size: 48px;
+  font-weight: 700;
+  line-height: 1.22;
+  letter-spacing: -0.01em;
+}
+
+.ppt-slide h2 {
+  font-size: 34px;
+  font-weight: 700;
+  line-height: 1.26;
+}
+
+.ppt-slide h3 {
+  font-size: 23px;
+  font-weight: 700;
+  line-height: 1.32;
+}
+
+.ppt-slide p {
+  font-size: 19px;
+  line-height: 1.55;
+}
+
+.ppt-slide ul,
+.ppt-slide ol {
+  padding-left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ppt-slide li {
+  font-size: 19px;
+  line-height: 1.52;
+}
+
+.ppt-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ppt-kicker {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ppt-accent);
+}
+
+.ppt-subtitle {
+  font-size: 21px;
+  line-height: 1.5;
+  color: var(--ppt-muted);
+}
+
+.ppt-slide--dark .ppt-subtitle {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.ppt-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.ppt-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+}
+
+.ppt-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.ppt-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.ppt-card {
+  background-color: var(--ppt-surface);
+  border: 1px solid var(--ppt-border);
+  border-radius: 14px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ppt-slide--dark .ppt-card {
+  background-color: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+  color: var(--ppt-on-primary);
+}
+
+.ppt-stat {
+  font-size: 48px;
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--ppt-primary);
+}
+
+.ppt-slide--dark .ppt-stat {
+  color: var(--ppt-accent);
+}
+
+.ppt-badge {
+  display: inline-block;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background-color: var(--ppt-accent);
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.ppt-table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: var(--ppt-surface);
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--ppt-border);
+}
+
+.ppt-table th,
+.ppt-table td {
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 1px solid var(--ppt-border);
+  font-size: 17px;
+  line-height: 1.45;
+  vertical-align: middle;
+}
+
+.ppt-table th {
+  background-color: var(--ppt-primary);
+  color: var(--ppt-on-primary);
+  font-weight: 700;
+}
+
+.ppt-footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--ppt-border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 14px;
+  color: var(--ppt-muted);
+}
+
+.ppt-slide--dark .ppt-footer {
+  border-top-color: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+/* 导出渐变背景时临时隐藏前景文字，保证导出的文字仍为原生可编辑文本框 */
+.ppt-export-bg-only {
+  color: transparent !important;
+}
+
+.ppt-export-bg-only * {
+  visibility: hidden !important;
+}
+
+/* 在线预览与全屏放映动画（仅在 .ppt-animate-active 时触发，不影响编辑、缩略图、排版检测与 PDF/PPTX 导出） */
+@keyframes ppt-trans-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes ppt-trans-push {
+  from { opacity: 0.25; transform: translateX(64px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes ppt-trans-wipe {
+  from { clip-path: inset(0 100% 0 0); }
+  to { clip-path: inset(0 0 0 0); }
+}
+@keyframes ppt-trans-zoom {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.ppt-animate-active.ppt-trans-fade > .ppt-slide-inner,
+.ppt-animate-active.ppt-trans-fade > :first-child { animation: ppt-trans-fade 0.42s ease-out both; }
+.ppt-animate-active.ppt-trans-push > .ppt-slide-inner,
+.ppt-animate-active.ppt-trans-push > :first-child { animation: ppt-trans-push 0.44s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.ppt-animate-active.ppt-trans-wipe > .ppt-slide-inner,
+.ppt-animate-active.ppt-trans-wipe > :first-child { animation: ppt-trans-wipe 0.46s ease-out both; }
+.ppt-animate-active.ppt-trans-zoom > .ppt-slide-inner,
+.ppt-animate-active.ppt-trans-zoom > :first-child { animation: ppt-trans-zoom 0.44s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+@keyframes ppt-el-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes ppt-el-fade-up {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes ppt-el-fly-left {
+  from { opacity: 0; transform: translateX(-44px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes ppt-el-fly-right {
+  from { opacity: 0; transform: translateX(44px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes ppt-el-zoom-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes ppt-el-wipe {
+  from { opacity: 0; clip-path: inset(0 100% 0 0); }
+  to { opacity: 1; clip-path: inset(0 0 0 0); }
+}
+
+.ppt-animate-active [data-anim="fade"] { animation: ppt-el-fade 0.42s ease-out both; animation-delay: var(--ppt-anim-delay, 0.12s); }
+.ppt-animate-active [data-anim="fade-up"] { animation: ppt-el-fade-up 0.46s cubic-bezier(0.22, 1, 0.36, 1) both; animation-delay: var(--ppt-anim-delay, 0.12s); }
+.ppt-animate-active [data-anim="fly-left"] { animation: ppt-el-fly-left 0.46s cubic-bezier(0.22, 1, 0.36, 1) both; animation-delay: var(--ppt-anim-delay, 0.12s); }
+.ppt-animate-active [data-anim="fly-right"] { animation: ppt-el-fly-right 0.46s cubic-bezier(0.22, 1, 0.36, 1) both; animation-delay: var(--ppt-anim-delay, 0.12s); }
+.ppt-animate-active [data-anim="zoom-in"] { animation: ppt-el-zoom-in 0.44s cubic-bezier(0.22, 1, 0.36, 1) both; animation-delay: var(--ppt-anim-delay, 0.12s); }
+.ppt-animate-active [data-anim="wipe"] { animation: ppt-el-wipe 0.48s ease-out both; animation-delay: var(--ppt-anim-delay, 0.12s); }
+
+.ppt-animate-active [data-anim-order="1"] { --ppt-anim-delay: 0.12s; }
+.ppt-animate-active [data-anim-order="2"] { --ppt-anim-delay: 0.28s; }
+.ppt-animate-active [data-anim-order="3"] { --ppt-anim-delay: 0.44s; }
+.ppt-animate-active [data-anim-order="4"] { --ppt-anim-delay: 0.60s; }
+.ppt-animate-active [data-anim-order="5"] { --ppt-anim-delay: 0.76s; }
+.ppt-animate-active [data-anim-order="6"] { --ppt-anim-delay: 0.92s; }
+.ppt-animate-active [data-anim-order="7"] { --ppt-anim-delay: 1.08s; }
+.ppt-animate-active [data-anim-order="8"] { --ppt-anim-delay: 1.24s; }
+.ppt-animate-active [data-anim-order="9"] { --ppt-anim-delay: 1.40s; }
+.ppt-animate-active [data-anim-order="10"] { --ppt-anim-delay: 1.56s; }
+
+/* 全屏放映中等待单击触发的入场元素 */
+.ppt-animate-active .ppt-anim-pending {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  animation: none !important;
+}

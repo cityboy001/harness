@@ -1,14 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
-  ArrowLeft, Blocks, Check, ChevronDown, CircleAlert, Code2, Ellipsis, FileCode2, FileText, FolderOpen,
-  Copy, Globe2, Link2, LoaderCircle, LockKeyhole, LogOut, Monitor, Pencil, Play, Plus, RotateCw, Send, Settings2,
+  ArrowLeft, Blocks, BookText, Check, ChevronDown, CircleAlert, Code2, Ellipsis, FileCode2, FileText, FolderOpen,
+  Copy, Globe2, Link2, LoaderCircle, LockKeyhole, LogOut, Monitor, Pencil, Play, Plus, Presentation, RotateCw, Send, Settings2,
   Sparkles, Square, Trash2, X
 } from 'lucide-vue-next';
 import { ApiError, api, message, type Conversation, type Model, type Project, type ProjectChat, type ProjectKind, type ProjectWorkspace, type Revision, type SharedRevision, type ShareLink, type User } from './api';
 import PreviewFrame from './PreviewFrame.vue';
 import AgentProgress from './AgentProgress.vue';
 import ReportPane from './ReportPane.vue';
+import PptPane from './PptPane.vue';
+import WordPane from './WordPane.vue';
 
 const conversationPane = ref<HTMLElement | null>(null);
 const conversationWidth = ref<number>();
@@ -139,9 +141,13 @@ const running = computed(() => Boolean(activeGeneration.value));
 const runningInAnotherChat = computed(() => activeGeneration.value !== null && (activeGeneration.value.chat_id ?? '') !== selectedChat.value);
 const customModels = computed(() => models.value.filter((model) => model.source === 'custom'));
 const research = computed(() => current.value?.kind === 'research');
-const websiteProjects = computed(() => projects.value.filter((item) => item.kind !== 'research'));
+const ppt = computed(() => current.value?.kind === 'ppt');
+const word = computed(() => current.value?.kind === 'word');
+const websiteProjects = computed(() => projects.value.filter((item) => item.kind === 'website'));
 const researchProjects = computed(() => projects.value.filter((item) => item.kind === 'research'));
-const workspaceModels = computed(() => research.value ? models.value.filter((model) => model.source !== 'demo') : models.value);
+const pptProjects = computed(() => projects.value.filter((item) => item.kind === 'ppt'));
+const wordProjects = computed(() => projects.value.filter((item) => item.kind === 'word'));
+const workspaceModels = computed(() => (research.value || ppt.value || word.value) ? models.value.filter((model) => model.source !== 'demo') : models.value);
 const activeModel = computed(() => workspaceModels.value.find((model) => model.id === selectedModel.value) ?? platform.value);
 const fileNames = computed(() => Object.keys(source.value?.files ?? {}).sort());
 const demoModel = computed(() => models.value.find((model) => model.source === 'demo'));
@@ -182,7 +188,7 @@ function openReport(id: string) {
   if (!current.value) return;
   reportId.value = id;
   setUrl(current.value.id, false, selectedChat.value, id);
-  void nextTick(() => document.getElementById('report-pane-heading')?.focus());
+  void nextTick(() => document.getElementById(ppt.value ? 'ppt-pane-heading' : word.value ? 'word-pane-heading' : 'report-pane-heading')?.focus());
 }
 function resetWorkspace() {
   viewToken++;
@@ -340,8 +346,9 @@ function updateWorkspace(result: ProjectWorkspace) {
   history.value = result.messages;
 }
 function showLinkedReport(id: string) {
-  const reports = research.value ? history.value.filter(item => item.result_type === 'report') : [];
-  reportId.value = reports.find(item => item.id === id)?.id ?? reports.at(-1)?.id ?? '';
+  const targetType = research.value ? 'report' : ppt.value ? 'ppt' : word.value ? 'word' : null;
+  const items = targetType ? history.value.filter(item => item.result_type === targetType) : [];
+  reportId.value = items.find(item => item.id === id)?.id ?? items.at(-1)?.id ?? '';
 }
 async function openProject(id: string, updateUrl = true, chat = '', report = '') {
   if (current.value?.id === id) return;
@@ -357,7 +364,7 @@ async function openProject(id: string, updateUrl = true, chat = '', report = '')
     if (viewToken !== token || !user.value) return;
     selectedChat.value = chat;
     updateWorkspace(result);
-    if (research.value && selectedModel.value === 'demo') selectedModel.value = 'platform';
+    if ((research.value || ppt.value || word.value) && selectedModel.value === 'demo') selectedModel.value = 'platform';
     showLinkedReport(report);
     setUrl(id, !updateUrl, chat, reportId.value);
     if (result.project.preview === 'running' || result.project.draftRevision) await loadPreview();
@@ -420,10 +427,20 @@ async function refreshWorkspace(force = false) {
     const changedHistory = result.messages.length !== history.value.length || result.messages.at(-1)?.state !== history.value.at(-1)?.state;
     const changedAgentEvents = result.messages.at(-1)?.agent_events?.length !== history.value.at(-1)?.agent_events?.length;
     const atBottom = thread.value && thread.value.scrollHeight - thread.value.scrollTop - thread.value.clientHeight < 36;
+    const previousLastDoc = (ppt.value || word.value)
+      ? history.value.filter(item => item.result_type === (ppt.value ? 'ppt' : 'word')).at(-1)?.id
+      : '';
     updateWorkspace(result);
     if (research.value && !reportId.value) {
       showLinkedReport('');
       if (reportId.value) setUrl(id, true, chat, reportId.value);
+    }
+    if (ppt.value || word.value) {
+      const latestDoc = history.value.filter(item => item.result_type === (ppt.value ? 'ppt' : 'word')).at(-1)?.id ?? '';
+      if (latestDoc && (!reportId.value || latestDoc !== previousLastDoc)) {
+        reportId.value = latestDoc;
+        setUrl(id, true, chat, latestDoc);
+      }
     }
     if (changedHistory || (changedAgentEvents && atBottom)) scrollThread();
     if (changed || differentStatus || changedDraft) {
@@ -646,7 +663,7 @@ onUnmounted(() => {
       <h1>无法打开分享预览</h1><p role="alert">{{ sharedError }}</p>
     </div>
   </main>
-  <div v-else class="app-shell" :class="{ 'has-workspace': current, 'has-report-workspace': research }">
+  <div v-else class="app-shell" :class="{ 'has-workspace': current, 'has-report-workspace': research || ppt || word }">
     <header class="topbar">
       <div v-if="current" class="breadcrumbs">
         <button class="quiet back" type="button" @click="back"><ArrowLeft :size="17" /> 我的项目</button>
@@ -698,21 +715,31 @@ onUnmounted(() => {
         <button class="primary" @click="projectModal('create')"><Plus :size="17" /> 新建项目</button>
       </div>
       <p v-if="pageError" class="error notice" role="alert">{{ pageError }}</p>
-      <section v-for="group in [{ kind: 'website', items: websiteProjects }, { kind: 'research', items: researchProjects }]"
-        :key="group.kind" :class="{ 'research-projects': group.kind === 'research' }"
-        :aria-label="group.kind === 'research' ? '调研报告' : '网站项目'">
+      <section v-for="group in [{ kind: 'website', items: websiteProjects }, { kind: 'research', items: researchProjects }, { kind: 'ppt', items: pptProjects }, { kind: 'word', items: wordProjects }]"
+        :key="group.kind" :class="{ 'research-projects': group.kind !== 'website' }"
+        :aria-label="group.kind === 'research' ? '调研报告' : group.kind === 'ppt' ? 'PPT 演示文稿' : group.kind === 'word' ? 'Word 文档' : '网站项目'">
         <header v-if="group.kind === 'research'" class="research-entry">
           <span class="project-icon"><FileText :size="20" /></span>
           <div><h2>调研报告</h2><p>联网查资料，在线编辑和导出报告。</p></div>
           <button type="button" @click="projectModal('create', undefined, 'research')"><Plus :size="17" /> 新建调研</button>
         </header>
+        <header v-else-if="group.kind === 'ppt'" class="research-entry">
+          <span class="project-icon"><Presentation :size="20" /></span>
+          <div><h2>PPT 演示文稿</h2><p>浏览器实时排版检查，在线预览、编辑并导出 PPTX / PDF。</p></div>
+          <button type="button" @click="projectModal('create', undefined, 'ppt')"><Plus :size="17" /> 新建 PPT</button>
+        </header>
+        <header v-else-if="group.kind === 'word'" class="research-entry">
+          <span class="project-icon"><BookText :size="20" /></span>
+          <div><h2>Word 文档</h2><p>浏览器 A4 排版自检，在线编辑并导出原生 Word (.docx) / PDF。</p></div>
+          <button type="button" @click="projectModal('create', undefined, 'word')"><Plus :size="17" /> 新建 Word</button>
+        </header>
         <div v-if="group.items.length" class="project-list">
           <article v-for="item in group.items" :key="item.id" class="project-row">
             <span class="project-icon">
-              <FileText v-if="item.kind === 'research'" :size="20" /><Globe2 v-else :size="20" />
+              <FileText v-if="item.kind === 'research'" :size="20" /><Presentation v-else-if="item.kind === 'ppt'" :size="20" /><BookText v-else-if="item.kind === 'word'" :size="20" /><Globe2 v-else :size="20" />
             </span>
             <button class="project-entry" @click="openProject(item.id)"><strong>{{ item.name }}</strong><span>{{ formatDate(item.updated) }} 更新</span></button>
-            <span v-if="item.kind !== 'research'" class="status" :class="item.preview"><i></i>{{ stateLabel(item) }}</span>
+            <span v-if="item.kind === 'website'" class="status" :class="item.preview"><i></i>{{ stateLabel(item) }}</span>
             <details class="menu row-menu">
               <summary class="icon" :aria-label="item.name + ' 项目操作'"><Ellipsis :size="19" /></summary>
               <div class="menu-items">
@@ -734,7 +761,7 @@ onUnmounted(() => {
       :style="{ '--conversation-width': conversationWidth === undefined ? undefined : conversationWidth + 'px' }">
       <aside id="conversation-pane" ref="conversationPane" class="conversation">
         <header class="pane-head chat-head">
-          <strong>{{ research ? '调研对话' : '建站对话' }}</strong>
+          <strong>{{ research ? '调研对话' : ppt ? 'PPT 对话' : word ? 'Word 对话' : '建站对话' }}</strong>
           <select :value="selectedChat" aria-label="切换对话" @change="selectChat(($event.target as HTMLSelectElement).value)">
             <option value="">默认对话</option>
             <option v-for="chat in chats" :key="chat.id" :value="chat.id">{{ chat.title }}</option>
@@ -745,8 +772,8 @@ onUnmounted(() => {
           <p v-if="loadingChat" class="meta">正在加载对话…</p>
           <div v-else-if="!history.length" class="empty-thread">
             <span class="large-icon"><Sparkles :size="22" /></span>
-            <h2>{{ research ? '你想了解什么？' : current.revision ? '这次想做什么？' : '你想做什么网站？' }}</h2>
-            <p>{{ research ? '可以直接提问，也可以让助手调研并生成带来源的报告。' : current.revision ? '可以提问，也可以继续修改当前网站。' : '说说要实现的功能，生成后可以继续在这里修改。' }}</p>
+            <h2>{{ research ? '你想了解什么？' : ppt ? '想做什么主题的 PPT？' : word ? '想撰写什么 Word 文档？' : current.revision ? '这次想做什么？' : '你想做什么网站？' }}</h2>
+            <p>{{ research ? '可以直接提问，也可以让助手调研并生成带来源的报告。' : ppt ? '描述主题、受众、页数或风格要求，Agent 会先在浏览器完成排版检查再输出。' : word ? '描述文档主题、用途、章节或内容要求，Agent 会先完成 A4 排版检查再输出。' : current.revision ? '可以提问，也可以继续修改当前网站。' : '说说要实现的功能，生成后可以继续在这里修改。' }}</p>
           </div>
           <div v-for="item in history" :key="item.id" class="message-pair">
             <div class="user-message">{{ item.prompt }}</div>
@@ -758,6 +785,14 @@ onUnmounted(() => {
                   :href="workspaceUrl(current.id, selectedChat, item.id).href"
                   :aria-current="reportId === item.id ? 'true' : undefined"
                   @click.left.exact.prevent="openReport(item.id)"><FileText :size="16" /> 查看调研报告</a>
+                <a v-else-if="item.result_type === 'ppt'" class="report-link"
+                  :href="workspaceUrl(current.id, selectedChat, item.id).href"
+                  :aria-current="reportId === item.id ? 'true' : undefined"
+                  @click.left.exact.prevent="openReport(item.id)"><Presentation :size="16" /> 查看 PPT</a>
+                <a v-else-if="item.result_type === 'word'" class="report-link"
+                  :href="workspaceUrl(current.id, selectedChat, item.id).href"
+                  :aria-current="reportId === item.id ? 'true' : undefined"
+                  @click.left.exact.prevent="openReport(item.id)"><BookText :size="16" /> 查看 Word 文档</a>
                 <div v-if="item.state === 'failed'" class="generation-error">
                   <p class="danger-text" role="alert"><CircleAlert :size="16" aria-hidden="true" /><span>{{ item.response }}</span></p>
                   <button class="quiet retry" :disabled="running || sending" @click="generate(item.prompt, item.model_id, item.has_checkpoint ? item.id : undefined)"><RotateCw :size="14" /> {{ item.has_checkpoint ? '继续修改候选' : '重试' }}</button>
@@ -773,7 +808,7 @@ onUnmounted(() => {
         </div>
         <div class="editor-area">
           <div v-if="activeModel?.source === 'platform' && !activeModel.available" class="model-note">
-            <CircleAlert :size="15" /><span>平台 DeepSeek 尚未配置。<button class="link" @click="showModels">添加自己的 Key</button><template v-if="demoModel && !research">，或<button class="link" @click="sample">试用待办演示</button>。</template></span>
+            <CircleAlert :size="15" /><span>平台 DeepSeek 尚未配置。<button class="link" @click="showModels">添加自己的 Key</button><template v-if="demoModel && !research && !ppt && !word">，或<button class="link" @click="sample">试用待办演示</button>。</template></span>
           </div>
           <div v-else-if="activeModel?.source === 'demo'" class="model-note">
             <CircleAlert :size="15" /><span>离线样例只生成待办网站。<button class="link" @click="sample">{{ current.revision ? '填入修改示例' : '填入需求示例' }}</button></span>
@@ -783,8 +818,8 @@ onUnmounted(() => {
           </div>
           <p v-if="workspaceError || pollError" class="error" role="alert">{{ workspaceError || pollError }}</p>
           <form class="composer" @submit.prevent="generate()">
-            <textarea v-model="prompt" @keydown.enter="sendOnEnter" :aria-label="research ? '调研主题' : '建站需求'"
-              :placeholder="research ? '提问、继续讨论，或要求生成调研报告…' : current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
+            <textarea v-model="prompt" @keydown.enter="sendOnEnter" :aria-label="research ? '调研主题' : ppt ? 'PPT 需求' : word ? 'Word 文档需求' : '建站需求'"
+              :placeholder="research ? '提问、继续讨论，或要求生成调研报告…' : ppt ? '描述 PPT 主题、页数、风格，或要求修改某一页…' : word ? '描述 Word 文档主题、章节、受众，或要求修改某一章…' : current.revision ? '提问，或描述你想修改的地方…' : '提问，或描述你想生成的网站…'" rows="3" maxlength="6000"></textarea>
             <div class="composer-actions">
               <div class="model-choice">
                 <select v-model="selectedModel" aria-label="调用模型">
@@ -806,6 +841,8 @@ onUnmounted(() => {
         @pointerup="endDividerDrag" @pointercancel="endDividerDrag" @lostpointercapture="endDividerDrag"
         @keydown="resizeDividerByKey"></div>
       <ReportPane v-if="research" :project-id="current.id" :report-id="reportId" />
+      <PptPane v-else-if="ppt" :project-id="current.id" :deck-id="reportId" />
+      <WordPane v-else-if="word" :project-id="current.id" :doc-id="reportId" />
       <section v-else class="result">
         <header class="pane-head result-head">
           <div class="tabs" aria-label="结果视图">
@@ -850,7 +887,7 @@ onUnmounted(() => {
   <div v-if="modal" class="modal-overlay" @click.self="closeModal" @keydown.esc="closeModal">
     <section class="dialog" :class="{ 'model-dialog': modal === 'models' }" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
       <header class="dialog-heading">
-        <h2 id="dialog-title">{{ { create: newProjectKind === 'research' ? '新建调研' : '新建项目', rename: '重命名项目', delete: '删除项目', models: '模型设置', share: '分享预览' }[modal] }}</h2>
+        <h2 id="dialog-title">{{ { create: newProjectKind === 'research' ? '新建调研' : newProjectKind === 'ppt' ? '新建 PPT' : newProjectKind === 'word' ? '新建 Word 文档' : '新建项目', rename: '重命名项目', delete: '删除项目', models: '模型设置', share: '分享预览' }[modal] }}</h2>
         <button class="icon" aria-label="关闭" @click="closeModal"><X :size="20" /></button>
       </header>
       <template v-if="modal === 'share'">
@@ -893,13 +930,13 @@ onUnmounted(() => {
         </form>
       </template>
       <form v-else class="stack" @submit.prevent="saveProject">
-        <p v-if="modal === 'delete'">确定删除「{{ target?.name }}」吗？{{ target?.kind === 'research' ? '该项目的对话和报告将一起删除。' : '该项目的对话、源码和预览数据将一起删除。' }}</p>
-        <label v-else>项目名称<input ref="nameInput" v-model.trim="name" required maxlength="60" :placeholder="newProjectKind === 'research' ? '例如：行业趋势调研' : '例如：每日待办'"></label>
+        <p v-if="modal === 'delete'">确定删除「{{ target?.name }}」吗？{{ target?.kind === 'research' ? '该项目的对话和报告将一起删除。' : target?.kind === 'ppt' ? '该项目的对话和所有 PPT 版本将一起删除。' : target?.kind === 'word' ? '该项目的对话和所有 Word 文档版本将一起删除。' : '该项目的对话、源码和预览数据将一起删除。' }}</p>
+        <label v-else>项目名称<input ref="nameInput" v-model.trim="name" required maxlength="60" :placeholder="newProjectKind === 'research' ? '例如：行业趋势调研' : newProjectKind === 'ppt' ? '例如：Q3 产品战略汇报' : newProjectKind === 'word' ? '例如：2026 年度数字化实施方案' : '例如：每日待办'"></label>
         <p v-if="modalError" class="error" role="alert">{{ modalError }}</p>
         <div class="dialog-actions">
           <button type="button" @click="closeModal">取消</button>
           <button v-if="modal === 'delete'" class="danger" :disabled="busy" type="submit">删除项目</button>
-          <button v-else class="primary" :disabled="busy" type="submit">{{ modal === 'create' ? newProjectKind === 'research' ? '创建调研' : '创建项目' : '保存' }}</button>
+          <button v-else class="primary" :disabled="busy" type="submit">{{ modal === 'create' ? newProjectKind === 'research' ? '创建调研' : newProjectKind === 'ppt' ? '创建 PPT' : newProjectKind === 'word' ? '创建 Word' : '创建项目' : '保存' }}</button>
         </div>
       </form>
     </section>

@@ -14,14 +14,29 @@ import { demoCompletion } from './demo.mjs';
 import { cleanReport, quickResearchReply, reportDocument, runResearchTurn } from './research.mjs';
 import { showReportCharts } from './report-charts.mjs';
 import { deepSeekWebTools } from './web-research.mjs';
+import { normalizeDeck } from './ppt-deck.mjs';
+import { closePptBrowser } from './ppt-browser.mjs';
+import { exportDeckToPdf, exportDeckToPptx } from './ppt-export.mjs';
+import { quickPptReply, runPptTurn } from './ppt.mjs';
+import { normalizeWordDoc } from './word-doc.mjs';
+import { exportWordToDocx, exportWordToPdf } from './word-export.mjs';
+import { quickWordReply, runWordTurn } from './word.mjs';
 
 const id = () => randomUUID().replaceAll('-', '');
 const dayKey = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
 const sessionKey = (request) => cookieValue(request.headers.cookie);
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 const assetTypes = { js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', svg: 'image/svg+xml' };
-const selectProjects = `SELECT projects.*, CASE WHEN research_projects.project_id IS NULL THEN 'website' ELSE 'research' END AS kind
-  FROM projects LEFT JOIN research_projects ON research_projects.project_id = projects.id`;
+const selectProjects = `SELECT projects.*, CASE
+  WHEN research_projects.project_id IS NOT NULL THEN 'research'
+  WHEN ppt_projects.project_id IS NOT NULL THEN 'ppt'
+  WHEN word_projects.project_id IS NOT NULL THEN 'word'
+  ELSE 'website'
+END AS kind
+  FROM projects
+  LEFT JOIN research_projects ON research_projects.project_id = projects.id
+  LEFT JOIN ppt_projects ON ppt_projects.project_id = projects.id
+  LEFT JOIN word_projects ON word_projects.project_id = projects.id`;
 
 function field(value, label, max, min = 1) {
   const result = typeof value === 'string' ? value.trim() : '';
@@ -282,12 +297,14 @@ export async function createApp(config) {
     const owner = user(request).id;
     const name = field(request.body?.name, '项目名称', 60);
     const kind = request.body?.kind ?? 'website';
-    if (!['website', 'research'].includes(kind)) throw new PublicError(400, '项目类型无效。');
+    if (!['website', 'research', 'ppt', 'word'].includes(kind)) throw new PublicError(400, '项目类型无效。');
     if (store.get('SELECT count(*) AS count FROM projects WHERE user_id = ?', owner).count >= 30) throw new PublicError(409, '项目数量已达上限。');
     const item = { id: id(), name, kind, user_id: owner, updated: Date.now(), active_revision: null };
     store.transaction(() => {
       store.run('INSERT INTO projects VALUES (?, ?, ?, ?, NULL)', item.id, owner, name, item.updated);
       if (kind === 'research') store.run('INSERT INTO research_projects VALUES (?)', item.id);
+      if (kind === 'ppt') store.run('INSERT INTO ppt_projects VALUES (?)', item.id);
+      if (kind === 'word') store.run('INSERT INTO word_projects VALUES (?)', item.id);
     });
     return reply.code(201).send(projectView(item));
   });
@@ -381,9 +398,95 @@ export async function createApp(config) {
       .header('Content-Disposition', "attachment; filename=report.html; filename*=UTF-8''" + fileName + '.html')
       .send(reportDocument(report.html));
   });
+  function ownedPptDeck(request) {
+    const item = ownedProject(request);
+    const row = store.get(`SELECT ppt_decks.deck, ppt_decks.version FROM ppt_decks JOIN messages ON messages.id = ppt_decks.message_id
+      WHERE messages.id = ? AND messages.project_id = ?`, request.params.messageId, item.id);
+    if (!row) throw new PublicError(404, '找不到该 PPT 演示文稿。');
+    return { item, deck: JSON.parse(row.deck), version: row.version };
+  }
+  route('GET', '/projects/:id/ppt/:messageId', async (request) => {
+    const { deck, version } = ownedPptDeck(request);
+    return { deck, version };
+  });
+  app.route({
+    method: 'PATCH', url: prefix + '/api/projects/:id/ppt/:messageId', bodyLimit: 700000,
+    async handler(request) {
+      const { item, deck, version } = ownedPptDeck(request);
+      if (request.body?.version !== version) throw new PublicError(409, 'PPT 已有更新，请刷新后重新编辑。');
+      const normalized = normalizeDeck(request.body?.deck);
+      const serialized = JSON.stringify(normalized);
+      if (serialized === JSON.stringify(deck)) return { deck, version };
+      store.transaction(() => {
+        store.run('UPDATE ppt_decks SET deck = ?, version = version + 1 WHERE message_id = ?', serialized, request.params.messageId);
+        store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+      });
+      return { deck: normalized, version: version + 1 };
+    }
+  });
+  route('GET', '/projects/:id/ppt/:messageId/export', async (request, reply) => {
+    const { item, deck } = ownedPptDeck(request);
+    const format = request.query?.format === 'pdf' ? 'pdf' : 'pptx';
+    const baseName = (deck.title || item.name || 'presentation').trim().slice(0, 80);
+    const fileName = encodeURIComponent(baseName).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16));
+    if (format === 'pdf') {
+      const pdf = await exportDeckToPdf(deck);
+      return reply.type('application/pdf')
+        .header('Content-Disposition', "attachment; filename=slides.pdf; filename*=UTF-8''" + fileName + '.pdf')
+        .send(pdf);
+    }
+    const pptx = await exportDeckToPptx(deck);
+    return reply.type('application/vnd.openxmlformats-officedocument.presentationml.presentation')
+      .header('Content-Disposition', "attachment; filename=slides.pptx; filename*=UTF-8''" + fileName + '.pptx')
+      .send(pptx);
+  });
+  function ownedWordDoc(request) {
+    const item = ownedProject(request);
+    const row = store.get(`SELECT word_docs.doc, word_docs.version FROM word_docs JOIN messages ON messages.id = word_docs.message_id
+      WHERE messages.id = ? AND messages.project_id = ?`, request.params.messageId, item.id);
+    if (!row) throw new PublicError(404, '找不到该 Word 文档。');
+    return { item, doc: JSON.parse(row.doc), version: row.version };
+  }
+  route('GET', '/projects/:id/word/:messageId', async (request) => {
+    const { doc, version } = ownedWordDoc(request);
+    return { doc, version };
+  });
+  app.route({
+    method: 'PATCH', url: prefix + '/api/projects/:id/word/:messageId', bodyLimit: 800000,
+    async handler(request) {
+      const { item, doc, version } = ownedWordDoc(request);
+      if (request.body?.version !== version) throw new PublicError(409, 'Word 文档已有更新，请刷新后重新编辑。');
+      const normalized = normalizeWordDoc(request.body?.doc);
+      const serialized = JSON.stringify(normalized);
+      if (serialized === JSON.stringify(doc)) return { doc, version };
+      store.transaction(() => {
+        store.run('UPDATE word_docs SET doc = ?, version = version + 1 WHERE message_id = ?', serialized, request.params.messageId);
+        store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+      });
+      return { doc: normalized, version: version + 1 };
+    }
+  });
+  route('GET', '/projects/:id/word/:messageId/export', async (request, reply) => {
+    const { item, doc } = ownedWordDoc(request);
+    const format = request.query?.format === 'pdf' ? 'pdf' : 'docx';
+    const baseName = (doc.title || item.name || 'document').trim().slice(0, 80);
+    const fileName = encodeURIComponent(baseName).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16));
+    if (format === 'pdf') {
+      const pdf = await exportWordToPdf(doc);
+      return reply.type('application/pdf')
+        .header('Content-Disposition', "attachment; filename=document.pdf; filename*=UTF-8''" + fileName + '.pdf')
+        .send(pdf);
+    }
+    const docx = await exportWordToDocx(doc);
+    return reply.type('application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+      .header('Content-Disposition', "attachment; filename=document.docx; filename*=UTF-8''" + fileName + '.docx')
+      .send(docx);
+  });
   route('POST', '/projects/:id/generate', async (request, reply) => {
     const item = ownedProject(request);
     const research = item.kind === 'research';
+    const ppt = item.kind === 'ppt';
+    const word = item.kind === 'word';
     const chat = projectChat(item.id, request.body?.chatId);
     const resumeId = request.body?.resumeMessageId == null ? null : field(request.body.resumeMessageId, '生成记录', 64);
     const resume = resumeId && store.get(`SELECT m.*, r.base_revision, r.draft_files FROM messages m JOIN generation_runs r ON r.message_id = m.id
@@ -393,9 +496,9 @@ export async function createApp(config) {
       throw new PublicError(409, '当前版本没有可继续的候选。');
     }
     const prompt = resume ? resume.prompt : field(request.body?.prompt, '需求', 6000);
-    const quickReply = research ? quickResearchReply(prompt) : undefined;
+    const quickReply = research ? quickResearchReply(prompt) : ppt ? quickPptReply(prompt) : word ? quickWordReply(prompt) : undefined;
     const modelId = resume ? resume.model_id : field(request.body?.modelId ?? 'platform', '模型', 64);
-    if (research && modelId === 'demo') throw new PublicError(400, '请选择支持联网调研的模型。');
+    if ((research || ppt || word) && modelId === 'demo') throw new PublicError(400, research ? '请选择支持联网调研的模型。' : '请选择支持对话生成的模型。');
     const model = modelConfig(modelId, item.user_id);
     const web = config.searchWeb === undefined && isDeepSeek(model) ? deepSeekWebTools(model.key) : undefined;
     const search = config.searchWeb ?? web?.search;
@@ -418,7 +521,7 @@ export async function createApp(config) {
       const now = Date.now();
       store.run('INSERT INTO messages (id, project_id, chat_id, prompt, model_id, model_name, state, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         messageId, item.id, chat, prompt, modelId, model.name, 'running', now);
-      if (modelId !== 'demo' && !research) store.run('INSERT INTO generation_runs (message_id, base_revision) VALUES (?, ?)', messageId, item.active_revision);
+      if (modelId !== 'demo' && !research && !ppt && !word) store.run('INSERT INTO generation_runs (message_id, base_revision) VALUES (?, ?)', messageId, item.active_revision);
       if (chat) store.run('UPDATE project_chats SET title = ? WHERE id = ? AND title IS NULL',
         [...prompt.replace(/\s+/gu, ' ')].slice(0, 32).join(''), chat);
       store.run('UPDATE projects SET updated = ? WHERE id = ?', now, item.id);
@@ -492,6 +595,80 @@ export async function createApp(config) {
             if (result.type === 'report') store.run('INSERT INTO reports (message_id, html) VALUES (?, ?)', messageId, result.html);
             store.run("UPDATE messages SET state = 'complete', result_type = ?, response = ?, agent_progress = NULL WHERE id = ?",
               result.type, result.text ?? null, messageId);
+            store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+          });
+          return;
+        }
+        if (ppt) {
+          const previousRow = !quickReply && store.get(`SELECT ppt_decks.deck FROM ppt_decks JOIN messages ON messages.id = ppt_decks.message_id
+            WHERE project_id = ? AND chat_id IS ? ORDER BY messages.created DESC, messages.rowid DESC LIMIT 1`, item.id, chat);
+          const previousDeck = previousRow ? JSON.parse(previousRow.deck) : undefined;
+          const recent = quickReply ? [] : store.all(`SELECT substr(prompt, 1, 1500) AS request, substr(response, 1, 2000) AS answer,
+            result_type AS result FROM messages WHERE project_id = ? AND chat_id IS ? AND state = 'complete'
+            ORDER BY created DESC, rowid DESC LIMIT 6`, item.id, chat).reverse();
+          const onProgress = (stage) => {
+            if (!signal.aborted) store.run("UPDATE messages SET agent_progress = ? WHERE id = ? AND state = 'running'", stage, messageId);
+          };
+          const onReasoning = (chunk) => {
+            if (signal.aborted || !chunk || reasoningTruncated) return;
+            const remain = reasoningLimit - reasoning.length;
+            if (chunk.length > remain) {
+              reasoning += chunk.slice(0, remain);
+              reasoningTruncated = true;
+            } else {
+              reasoning += chunk;
+            }
+            if (reasoningTruncated || Date.now() - lastReasoningWrite >= 400) flushReasoning();
+          };
+          onProgress('正在规划 PPT 结构与视觉主题…');
+          const result = quickReply ? { type: 'answer', text: quickReply } : await runPptTurn({
+            prompt, previousDeck, recent, search, read, signal, onProgress, onActivity, onReasoning,
+            maxTokens: isDeepSeek(model) ? (config.deepseekMaxTokens ?? 64000) : (config.maxTokens ?? 10000),
+            completion: (messages, maxTokens, options) => retryModelCompletion(completion, model, messages, maxTokens, options)
+          });
+          flushReasoning();
+          signal.throwIfAborted();
+          store.transaction(() => {
+            if (result.type === 'ppt') store.run('INSERT INTO ppt_decks (message_id, deck) VALUES (?, ?)', messageId, JSON.stringify(result.deck));
+            store.run("UPDATE messages SET state = 'complete', result_type = ?, response = ?, agent_progress = NULL WHERE id = ?",
+              result.type, result.type === 'ppt' ? result.summary : result.text ?? null, messageId);
+            store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
+          });
+          return;
+        }
+        if (word) {
+          const previousRow = !quickReply && store.get(`SELECT word_docs.doc FROM word_docs JOIN messages ON messages.id = word_docs.message_id
+            WHERE project_id = ? AND chat_id IS ? ORDER BY messages.created DESC, messages.rowid DESC LIMIT 1`, item.id, chat);
+          const previousDoc = previousRow ? JSON.parse(previousRow.doc) : undefined;
+          const recent = quickReply ? [] : store.all(`SELECT substr(prompt, 1, 1500) AS request, substr(response, 1, 2000) AS answer,
+            result_type AS result FROM messages WHERE project_id = ? AND chat_id IS ? AND state = 'complete'
+            ORDER BY created DESC, rowid DESC LIMIT 6`, item.id, chat).reverse();
+          const onProgress = (stage) => {
+            if (!signal.aborted) store.run("UPDATE messages SET agent_progress = ? WHERE id = ? AND state = 'running'", stage, messageId);
+          };
+          const onReasoning = (chunk) => {
+            if (signal.aborted || !chunk || reasoningTruncated) return;
+            const remain = reasoningLimit - reasoning.length;
+            if (chunk.length > remain) {
+              reasoning += chunk.slice(0, remain);
+              reasoningTruncated = true;
+            } else {
+              reasoning += chunk;
+            }
+            if (reasoningTruncated || Date.now() - lastReasoningWrite >= 400) flushReasoning();
+          };
+          onProgress('正在规划 Word 文档结构与样式…');
+          const result = quickReply ? { type: 'answer', text: quickReply } : await runWordTurn({
+            prompt, previousDoc, recent, search, read, signal, onProgress, onActivity, onReasoning,
+            maxTokens: isDeepSeek(model) ? (config.deepseekMaxTokens ?? 64000) : (config.maxTokens ?? 10000),
+            completion: (messages, maxTokens, options) => retryModelCompletion(completion, model, messages, maxTokens, options)
+          });
+          flushReasoning();
+          signal.throwIfAborted();
+          store.transaction(() => {
+            if (result.type === 'word') store.run('INSERT INTO word_docs (message_id, doc) VALUES (?, ?)', messageId, JSON.stringify(result.doc));
+            store.run("UPDATE messages SET state = 'complete', result_type = ?, response = ?, agent_progress = NULL WHERE id = ?",
+              result.type, result.type === 'word' ? result.summary : result.text ?? null, messageId);
             store.run('UPDATE projects SET updated = ? WHERE id = ?', Date.now(), item.id);
           });
           return;
@@ -789,7 +966,7 @@ export async function createApp(config) {
     clearInterval(expiryTimer);
     for (const { controller } of tasks.values()) controller.abort();
     await Promise.allSettled([...tasks.values()].map(({ task }) => task));
-    await Promise.all([preview.close(), sharedPreview.close()]);
+    await Promise.all([preview.close(), sharedPreview.close(), closePptBrowser()]);
     store.db.close();
   });
   return app;

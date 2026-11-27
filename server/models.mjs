@@ -100,7 +100,8 @@ function decodeModelJson(value) {
 const maxToolArgumentBytes = 128 * 1024;
 export function toolArgumentLimit(name) {
   if (name === 'stage_changes' || name === 'submit_patch' || name === 'test_preview') return maxToolArgumentBytes;
-  if (name === 'run_code') return 64 * 1024;
+  if (name === 'run_code' || name === 'upsert_slide' || name === 'upsert_section') return 64 * 1024;
+  if (name === 'set_deck_theme' || name === 'set_doc_meta') return 16 * 1024;
   return 8 * 1024;
 }
 

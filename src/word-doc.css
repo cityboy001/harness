@@ -1,0 +1,400 @@
+/* Word A4 文档统一基础样式（供前端预览、Playwright 排版自检与 DOCX/PDF 导出共用） */
+.word-doc {
+  --word-primary: #1e3a5f;
+  --word-accent: #2563eb;
+  --word-surface: #f8fafc;
+  --word-text: #1f2937;
+  --word-muted: #64748b;
+  --word-border: #cbd5e1;
+  --word-font: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", Arial, sans-serif;
+  --word-heading-font: var(--word-font);
+  --word-font-size: 14.5px;
+  --word-line-height: 1.5;
+  --word-para-gap: 5px;
+  --word-pad-x: 48px;
+  --word-pad-y: 42px;
+  --word-cell-pad-y: 5px;
+  --word-cell-pad-x: 8px;
+  --word-cell-font-size: 13px;
+  width: 794px;
+  margin: 0 auto;
+  color: var(--word-text);
+  font-family: var(--word-font);
+  font-size: var(--word-font-size);
+  line-height: var(--word-line-height);
+  box-sizing: border-box;
+  -webkit-font-smoothing: antialiased;
+}
+
+.word-doc *,
+.word-doc *::before,
+.word-doc *::after {
+  box-sizing: border-box;
+}
+
+.word-sheet {
+  background: #ffffff;
+  width: 794px;
+  padding: var(--word-pad-y) var(--word-pad-x);
+  box-sizing: border-box;
+}
+
+.word-cover {
+  min-height: 1020px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  border-top: 8px solid var(--word-primary);
+  page-break-after: always;
+  break-after: page;
+}
+
+.word-cover-kicker {
+  display: inline-block;
+  padding: 5px 14px;
+  border-radius: 4px;
+  background: var(--word-surface);
+  border-left: 4px solid var(--word-accent);
+  color: var(--word-primary);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.word-cover-main {
+  margin-top: 96px;
+}
+
+.word-cover-title {
+  margin: 24px 0 0;
+  font-size: 36px;
+  font-weight: 700;
+  line-height: 1.28;
+  color: var(--word-primary);
+}
+
+.word-cover-subtitle {
+  margin: 18px 0 0;
+  font-size: 18px;
+  line-height: 1.6;
+  color: var(--word-muted);
+}
+
+.word-cover-rule {
+  width: 72px;
+  height: 4px;
+  margin-top: 28px;
+  background: var(--word-accent);
+  border-radius: 2px;
+}
+
+.word-cover-meta {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 80px;
+  border-top: 2px solid var(--word-primary);
+}
+
+.word-cover-meta td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--word-border);
+  font-size: 14px;
+}
+
+.word-cover-meta td:first-child {
+  width: 120px;
+  font-weight: 700;
+  color: var(--word-primary);
+  background: var(--word-surface);
+}
+
+.word-toc {
+  page-break-after: always;
+  break-after: page;
+}
+
+.word-toc-title {
+  margin: 0 0 20px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--word-primary);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--word-primary);
+}
+
+.word-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.word-toc-item {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--word-border);
+  font-size: 15px;
+}
+
+.word-toc-num {
+  min-width: 32px;
+  font-weight: 700;
+  color: var(--word-accent);
+}
+
+.word-section {
+  margin-bottom: calc(var(--word-para-gap) * 2.5);
+}
+
+.word-section:last-child {
+  margin-bottom: 0;
+}
+
+.word-section.word-page-break {
+  page-break-before: always;
+  break-before: page;
+}
+
+.word-section-heading {
+  margin: 0 0 calc(var(--word-para-gap) * 1.6);
+  padding-bottom: 7px;
+  border-bottom: 2px solid var(--word-primary);
+  font-family: var(--word-heading-font);
+  font-size: calc(var(--word-font-size) * 1.48);
+  font-weight: 700;
+  line-height: 1.32;
+  color: var(--word-primary);
+}
+
+.word-doc.word-heading-bar .word-section-heading {
+  padding: 6px 12px;
+  border-bottom: 0;
+  border-left: 4px solid var(--word-accent);
+  background: var(--word-surface);
+}
+
+.word-doc.word-heading-plain .word-section-heading {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.word-doc.word-heading-center .word-section-heading {
+  padding-bottom: 4px;
+  border-bottom: 0;
+  text-align: center;
+  font-size: calc(var(--word-font-size) * 1.6);
+  letter-spacing: 0.06em;
+}
+
+.word-doc h1,
+.word-doc h2,
+.word-doc h3,
+.word-doc h4,
+.word-doc p,
+.word-doc ul,
+.word-doc ol,
+.word-doc blockquote,
+.word-doc figure,
+.word-doc pre {
+  margin: 0 0 var(--word-para-gap);
+}
+
+.word-doc h2 {
+  margin-top: calc(var(--word-para-gap) * 1.8);
+  font-family: var(--word-heading-font);
+  font-size: calc(var(--word-font-size) * 1.22);
+  font-weight: 700;
+  line-height: 1.38;
+  color: var(--word-primary);
+}
+
+.word-doc h3 {
+  margin-top: calc(var(--word-para-gap) * 1.4);
+  font-family: var(--word-heading-font);
+  font-size: calc(var(--word-font-size) * 1.08);
+  font-weight: 700;
+  line-height: 1.42;
+  color: var(--word-text);
+}
+
+.word-doc h4 {
+  margin-top: var(--word-para-gap);
+  font-family: var(--word-heading-font);
+  font-size: var(--word-font-size);
+  font-weight: 700;
+  line-height: 1.45;
+  color: var(--word-text);
+}
+
+.word-doc p {
+  font-size: var(--word-font-size);
+  line-height: var(--word-line-height);
+  text-align: left;
+}
+
+.word-doc.word-indent .word-section-body > p {
+  text-indent: 2em;
+}
+
+.word-doc ul,
+.word-doc ol {
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--word-para-gap) * 0.55);
+}
+
+.word-doc li {
+  font-size: var(--word-font-size);
+  line-height: var(--word-line-height);
+  margin: 0;
+}
+
+.word-doc blockquote,
+.word-callout {
+  margin: 14px 0 16px;
+  padding: 14px 18px;
+  background: var(--word-surface);
+  border-left: 4px solid var(--word-accent);
+  border-radius: 0 6px 6px 0;
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+
+.word-callout-title {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--word-primary);
+}
+
+.word-kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 14px;
+  margin: 16px 0 18px;
+}
+
+.word-kpi-card {
+  padding: 14px 16px;
+  background: var(--word-surface);
+  border: 1px solid var(--word-border);
+  border-top: 3px solid var(--word-accent);
+  border-radius: 6px;
+}
+
+.word-kpi-value {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--word-primary);
+}
+
+.word-kpi-label {
+  margin-top: 6px;
+  font-size: 13.5px;
+  color: var(--word-muted);
+  line-height: 1.4;
+}
+
+.word-table,
+.word-doc table:not(.word-cover-meta) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: calc(var(--word-para-gap) * 1.2) 0 calc(var(--word-para-gap) * 1.4);
+  table-layout: fixed;
+  word-break: break-word;
+}
+
+.word-doc table:not(.word-cover-meta) th,
+.word-doc table:not(.word-cover-meta) td {
+  padding: var(--word-cell-pad-y) var(--word-cell-pad-x);
+  border: 1px solid var(--word-border);
+  font-size: var(--word-cell-font-size);
+  line-height: 1.42;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.word-doc table:not(.word-cover-meta) th {
+  background: var(--word-primary);
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.word-doc table:not(.word-cover-meta) tbody tr:nth-child(even) td {
+  background: var(--word-surface);
+}
+
+.word-doc pre {
+  padding: 12px 14px;
+  background: var(--word-surface);
+  border: 1px solid var(--word-border);
+  border-radius: 6px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.word-doc code {
+  padding: 1px 5px;
+  background: var(--word-surface);
+  border-radius: 3px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.92em;
+}
+
+.word-doc pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.word-doc hr {
+  border: 0;
+  border-top: 1px solid var(--word-border);
+  margin: 18px 0;
+}
+
+.word-doc figure {
+  margin: 16px 0 18px;
+  text-align: center;
+}
+
+.word-doc figure svg,
+.word-doc svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+.word-doc figcaption {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--word-muted);
+  text-align: center;
+}
+
+.word-doc .word-blank {
+  display: inline-block;
+  min-width: 5.5em;
+  max-width: 100%;
+  padding: 0 0.25em;
+  border-bottom: 1px solid currentColor;
+  vertical-align: baseline;
+  line-height: 1.15;
+}
+
+.word-doc .word-blank.word-blank-sm {
+  min-width: 2.8em;
+}
+
+.word-doc .word-blank.word-blank-lg {
+  min-width: 10em;
+}

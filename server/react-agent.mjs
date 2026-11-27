@@ -36,8 +36,8 @@ class BuilderChatModel extends BaseChatModel {
 }
 
 export async function runReAct({ messages, definitions, handlers, completion, signal, maxTokens, maxToolTurns,
-  onReasoning, progress, finishInstructions, finalize, correction, recoverVerifiedDraft, budget = { remaining: maxTokens },
-  readReserve = Math.min(8000, Math.floor(maxTokens / 4)) }) {
+  maxCallsPerTurn = 4, onReasoning, progress, finishInstructions, finalize, correction, recoverVerifiedDraft,
+  budget = { remaining: maxTokens }, readReserve = Math.min(8000, Math.floor(maxTokens / 4)) }) {
   let turns = 0;
   let stalled = 0;
   let toolProgress;
@@ -86,10 +86,13 @@ export async function runReAct({ messages, definitions, handlers, completion, si
     budget.remaining = Math.max(0, budget.remaining - cost);
 
     const calls = message.tool_calls ?? [];
-    if (!Array.isArray(calls) || calls.length > 4 ||
+    if (!Array.isArray(calls) ||
         new Set(calls.map(call => call?.id)).size !== calls.length ||
         calls.some(call => typeof call?.id !== 'string' || !call.id || !names.has(call.function?.name))) {
       throw new PublicError(422, '模型请求了无效的工具操作。');
+    }
+    if (calls.length > maxCallsPerTurn) {
+      throw new PublicError(422, `模型单轮请求了 ${calls.length} 个工具调用（上限 ${maxCallsPerTurn} 个），属于无效的工具操作。`);
     }
     if (finishOnly && calls.length) throw new PublicError(422, '模型在结束读文件和测试后仍未提交有效修改，请重试。');
     toolErrors.clear();
